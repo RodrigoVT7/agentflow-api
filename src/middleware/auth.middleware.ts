@@ -3,6 +3,9 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { DecodedToken } from '../models/auth.model';
 import config from '../config/app.config';
+import { initAgentService } from '../services/agent.service';
+
+const agentService = initAgentService();
 
 // Extender el tipo Request para incluir el agente autenticado
 declare global {
@@ -34,6 +37,13 @@ export const authMiddleware = (req: Request, res: Response, next: NextFunction):
     
     // Verificar token
     const decoded = jwt.verify(token, config.auth.jwtSecret) as DecodedToken;
+    
+    // Verificar que el agente existe
+    const agent = agentService.getAgentById(decoded.agentId);
+    if (!agent) {
+      res.status(401).json({ error: 'Agente no encontrado' });
+      return;
+    }
     
     // Añadir información del agente al request
     req.agent = {

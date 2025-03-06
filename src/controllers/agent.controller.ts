@@ -5,14 +5,14 @@ import { initConversationService } from '../services/conversation.service';
 import { WhatsAppService } from '../services/whatsapp.service';
 import { Agent, AgentStatus } from '../models/agent.model';
 import { MessageSender } from '../models/message.model';
+import { initAgentService } from '../services/agent.service';
+import logger from '../utils/logger';
 
 // Servicios
 const queueService = initQueueService();
 const conversationService = initConversationService();
 const whatsappService = new WhatsAppService();
-
-// Mock de base de datos de agentes (en producción debería estar en una DB)
-const agentsDB = new Map<string, Agent>();
+const agentService = initAgentService();
 
 export class AgentController {
   /**
@@ -31,7 +31,10 @@ export class AgentController {
       
       res.json(queueData);
     } catch (error) {
-      next(error);
+      logger.error('Error en getQueue', { error });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al obtener la cola' });
+      }
     }
   };
 
@@ -49,9 +52,13 @@ export class AgentController {
         return;
       }
       
-      res.json(queueService.getMessages(chatId));
+      const messages = await queueService.getMessages(chatId);
+      res.json(messages);
     } catch (error) {
-      next(error);
+      logger.error('Error en getMessages', { error, chatId: req.params.chatId });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al obtener los mensajes' });
+      }
     }
   };
 
@@ -67,8 +74,10 @@ export class AgentController {
         return;
       }
       
+      logger.debug(`Asignando agente ${agentId} a conversación ${conversationId}`);
+      
       // Verificar que el agente existe
-      const agent = agentsDB.get(agentId);
+      const agent = agentService.getAgentById(agentId);
       if (!agent) {
         res.status(404).json({ error: 'Agente no encontrado' });
         return;
@@ -88,23 +97,40 @@ export class AgentController {
       }
       
       // Asignar agente
-      const success = queueService.assignAgent(conversationId, agentId);
+      const success = await queueService.assignAgent(conversationId, agentId);
       
-      if (await success) {
+      if (success) {
         // Actualizar estado del agente
-        agent.activeConversations.push(conversationId);
-        agent.status = agent.activeConversations.length >= agent.maxConcurrentChats 
-          ? AgentStatus.BUSY 
-          : AgentStatus.ONLINE;
+        const agentWithPassword = agentService.getAgentWithPasswordById(agentId);
+        if (agentWithPassword) {
+          // Asegurarse de que la conversación no esté duplicada en activeConversations
+          const existingConversations = agentWithPassword.activeConversations || [];
+          const newConversations = existingConversations.includes(conversationId) 
+            ? existingConversations 
+            : [...existingConversations, conversationId];
+          
+          const updatedAgent = {
+            ...agentWithPassword,
+            activeConversations: newConversations,
+            status: newConversations.length >= agentWithPassword.maxConcurrentChats 
+              ? AgentStatus.BUSY 
+              : AgentStatus.ONLINE,
+            lastActivity: Date.now()
+          };
+          
+          agentService.setAgent(updatedAgent);
+        }
         
-        agentsDB.set(agentId, agent);
-        
+        // Responder éxito
         res.json({ success: true });
       } else {
         res.status(500).json({ error: 'No se pudo asignar el agente' });
       }
     } catch (error) {
-      next(error);
+      logger.error('Error en assignAgent', { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al asignar agente' });
+      }
     }
   };
 
@@ -120,8 +146,10 @@ export class AgentController {
         return;
       }
       
+      logger.debug(`Enviando mensaje: Agente ${agentId}, Conversación ${conversationId}`);
+      
       // Verificar que el agente existe
-      const agent = agentsDB.get(agentId);
+      const agent = agentService.getAgentById(agentId);
       if (!agent) {
         res.status(404).json({ error: 'Agente no encontrado' });
         return;
@@ -129,15 +157,32 @@ export class AgentController {
       
       // Verificar que la conversación existe
       const conversation = queueService.getConversation(conversationId);
+      logger.debug(`Conversación encontrada:`, { conversation: JSON.stringify(conversation) });
+      
       if (!conversation) {
         res.status(404).json({ error: 'Conversación no encontrada' });
         return;
       }
       
       // Verificar que el agente está asignado a esta conversación
+      logger.debug(`Agente asignado: ${conversation.assignedAgent}, Solicitado: ${agentId}`);
+      
       if (conversation.assignedAgent !== agentId) {
-        res.status(403).json({ error: 'El agente no está asignado a esta conversación' });
-        return;
+        // Si no está asignado, intentar asignarlo automáticamente
+        logger.info(`Intento de auto-asignación para agente ${agentId} en conversación ${conversationId}`);
+        
+        // Asignar solo si no hay otro agente asignado
+        if (!conversation.assignedAgent) {
+          const assignSuccess = await queueService.assignAgent(conversationId, agentId);
+          if (!assignSuccess) {
+            res.status(403).json({ error: 'No se pudo asignar automáticamente al agente a esta conversación' });
+            return;
+          }
+          logger.info(`Auto-asignación exitosa para agente ${agentId} en conversación ${conversationId}`);
+        } else {
+          res.status(403).json({ error: 'El agente no está asignado a esta conversación' });
+          return;
+        }
       }
       
       // Añadir mensaje a la conversación
@@ -152,20 +197,41 @@ export class AgentController {
         return;
       }
       
-      // Enviar mensaje al usuario vía WhatsApp
-      await whatsappService.sendMessage(
-        conversation.phone_number_id,
-        conversationId,
-        message
-      );
-      
-      // Actualizar última actividad del agente
-      agent.lastActivity = Date.now();
-      agentsDB.set(agentId, agent);
-      
+      // Responder inmediatamente para evitar timeout
       res.json({ success: true, messageId: newMessage.id });
+      
+      // Enviar mensaje al usuario vía WhatsApp de forma asíncrona
+      (async () => {
+        try {
+          await whatsappService.sendMessage(
+            conversation.phone_number_id,
+            conversationId,
+            message
+          );
+          logger.info(`Mensaje ${newMessage.id} enviado correctamente a WhatsApp`);
+        } catch (whatsappError) {
+          logger.error(`Error al enviar mensaje ${newMessage.id} a WhatsApp:`, { error: whatsappError });
+        }
+        
+        // Actualizar última actividad del agente
+        const agentWithPassword = agentService.getAgentWithPasswordById(agentId);
+        if (agentWithPassword) {
+          const updatedAgent = {
+            ...agentWithPassword,
+            lastActivity: Date.now()
+          };
+          
+          agentService.setAgent(updatedAgent);
+        }
+      })().catch(error => {
+        logger.error(`Error en procesamiento asíncrono después de sendMessage:`, { error });
+      });
+      
     } catch (error) {
-      next(error);
+      logger.error("Error en sendMessage:", { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al enviar el mensaje' });
+      }
     }
   };
 
@@ -190,12 +256,16 @@ export class AgentController {
         }
         
         // Actualizar estado del agente
-        const agent = agentsDB.get(agentId);
+        const agent = agentService.getAgentWithPasswordById(agentId);
         if (agent) {
-          agent.activeConversations = agent.activeConversations.filter(id => id !== conversationId);
-          agent.status = agent.activeConversations.length === 0 ? AgentStatus.ONLINE : AgentStatus.BUSY;
-          agent.lastActivity = Date.now();
-          agentsDB.set(agentId, agent);
+          const updatedAgent = {
+            ...agent,
+            activeConversations: agent.activeConversations.filter(id => id !== conversationId),
+            status: agent.activeConversations.length <= 1 ? AgentStatus.ONLINE : AgentStatus.BUSY,
+            lastActivity: Date.now()
+          };
+          
+          agentService.setAgent(updatedAgent);
         }
       }
       
@@ -208,7 +278,10 @@ export class AgentController {
         res.status(500).json({ error: 'No se pudo finalizar la conversación' });
       }
     } catch (error) {
-      next(error);
+      logger.error('Error en completeConversation', { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al completar conversación' });
+      }
     }
   };
 
@@ -224,15 +297,18 @@ export class AgentController {
         return;
       }
       
-      const success = queueService.updatePriority(conversationId, priority);
+      const success = await queueService.updatePriority(conversationId, priority);
       
-      if (await success) {
+      if (success) {
         res.json({ success: true });
       } else {
         res.status(404).json({ error: 'Conversación no encontrada' });
       }
     } catch (error) {
-      next(error);
+      logger.error('Error en updatePriority', { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al actualizar prioridad' });
+      }
     }
   };
 
@@ -248,15 +324,18 @@ export class AgentController {
         return;
       }
       
-      const success = queueService.updateTags(conversationId, tags);
+      const success = await queueService.updateTags(conversationId, tags);
       
-      if (await success) {
+      if (success) {
         res.json({ success: true });
       } else {
         res.status(404).json({ error: 'Conversación no encontrada' });
       }
     } catch (error) {
-      next(error);
+      logger.error('Error en updateTags', { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al actualizar tags' });
+      }
     }
   };
 
@@ -272,7 +351,7 @@ export class AgentController {
         return;
       }
       
-      const agent = agentsDB.get(agentId);
+      const agent = agentService.getAgentWithPasswordById(agentId);
       
       if (!agent) {
         res.status(404).json({ error: 'Agente no encontrado' });
@@ -286,14 +365,20 @@ export class AgentController {
       }
       
       // Actualizar estado
-      agent.status = status as AgentStatus;
-      agent.lastActivity = Date.now();
+      const updatedAgent = {
+        ...agent,
+        status: status as AgentStatus,
+        lastActivity: Date.now()
+      };
       
-      agentsDB.set(agentId, agent);
+      agentService.setAgent(updatedAgent);
       
       res.json({ success: true });
     } catch (error) {
-      next(error);
+      logger.error('Error en updateAgentStatus', { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al actualizar estado del agente' });
+      }
     }
   };
 
@@ -302,7 +387,7 @@ export class AgentController {
    */
   public registerAgent = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const { name, email, role = 'agent', maxConcurrentChats = 3 } = req.body;
+      const { name, email, password, role = 'agent', maxConcurrentChats = 3 } = req.body;
       
       if (!name || !email) {
         res.status(400).json({ error: 'Se requieren name y email' });
@@ -310,31 +395,27 @@ export class AgentController {
       }
       
       // Verificar si ya existe
-      const existingAgents = Array.from(agentsDB.values());
-      const existingAgent = existingAgents.find(a => a.email === email);
+      const existingAgent = agentService.getAgentByEmail(email);
       
       if (existingAgent) {
         res.status(409).json({ error: 'Ya existe un agente con este email' });
         return;
       }
       
-      // Crear nuevo agente
-      const newAgent: Agent = {
-        id: `agent_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        name,
-        email,
-        status: AgentStatus.ONLINE,
-        activeConversations: [],
-        maxConcurrentChats,
-        role: role as 'agent' | 'supervisor' | 'admin',
-        lastActivity: Date.now()
-      };
+      // Si no se proporcionó contraseña, redirigir a AuthController.registerAgent
+      if (!password) {
+        res.status(400).json({ error: 'Se requiere password para registrar un nuevo agente' });
+        return;
+      }
       
-      agentsDB.set(newAgent.id, newAgent);
-      
-      res.status(201).json(newAgent);
+      // Si llegamos aquí, necesitamos la contraseña, así que importamos AuthController
+      const AuthController = require('../controllers/auth.controller').default;
+      return await AuthController.registerAgent(req, res, next);
     } catch (error) {
-      next(error);
+      logger.error('Error en registerAgent', { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al registrar agente' });
+      }
     }
   };
 
@@ -343,10 +424,43 @@ export class AgentController {
    */
   public getAgents = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const agents = Array.from(agentsDB.values());
+      const agents = agentService.getAgents();
       res.json(agents);
     } catch (error) {
-      next(error);
+      logger.error('Error en getAgents', { error });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al obtener agentes' });
+      }
+    }
+  };
+
+  /**
+   * Crear una conversación de prueba
+   */
+  public createTestConversation = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { conversationId, from, phone_number_id, metadata } = req.body;
+      
+      if (!conversationId || !from || !phone_number_id) {
+        res.status(400).json({ error: 'Se requieren conversationId, from y phone_number_id' });
+        return;
+      }
+      
+      // Añadir a la cola
+      const queueItem = await queueService.addToQueue({
+        conversationId,
+        from,
+        phone_number_id,
+        assignedAgent: null,
+        metadata: metadata || {}
+      });
+      
+      res.status(201).json(queueItem);
+    } catch (error) {
+      logger.error('Error en createTestConversation', { error, body: req.body });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al crear conversación de prueba' });
+      }
     }
   };
 }

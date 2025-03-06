@@ -7,49 +7,14 @@ import { Agent, AgentStatus } from '../models/agent.model';
 import { AuthResponse, UserCredentials, DecodedToken } from '../models/auth.model';
 import config from '../config/app.config';
 import logger from '../utils/logger';
+import { initAgentService } from '../services/agent.service';
 
-// Almacén temporal de agentes (en producción debe usarse una base de datos)
-const agentsDB = new Map<string, Agent & { password: string }>();
 // Almacén de tokens de refresco
 const refreshTokens = new Map<string, { agentId: string, expiresAt: number }>();
 
-// Añadir algunos agentes de prueba
-if (process.env.NODE_ENV !== 'production') {
-  // Crear un hash para la contraseña "admin123"
-  const createTestAgents = async () => {
-    const hashedPassword = await bcrypt.hash('admin123', 10);
-    
-    agentsDB.set('agent_test_1', {
-      id: 'agent_test_1',
-      name: 'Agente de Prueba',
-      email: 'agent@test.com',
-      password: hashedPassword,
-      status: AgentStatus.ONLINE,
-      activeConversations: [],
-      maxConcurrentChats: 3,
-      role: 'agent',
-      lastActivity: Date.now()
-    });
-    
-    agentsDB.set('admin_test_1', {
-      id: 'admin_test_1',
-      name: 'Administrador',
-      email: 'admin@test.com',
-      password: hashedPassword,
-      status: AgentStatus.ONLINE,
-      activeConversations: [],
-      maxConcurrentChats: 5,
-      role: 'admin',
-      lastActivity: Date.now()
-    });
-    
-    logger.info('Agentes de prueba creados');
-  };
-  
-  createTestAgents();
-}
-
 export class AuthController {
+  private agentService = initAgentService();
+
   /**
    * Iniciar sesión de agente
    */
@@ -62,8 +27,8 @@ export class AuthController {
         return;
       }
       
-      // Buscar agente por email (en producción debería ser una consulta a la base de datos)
-      const foundAgent = Array.from(agentsDB.values()).find(agent => agent.email === email);
+      // Buscar agente por email
+      const foundAgent = this.agentService.getAgentWithPasswordByEmail(email);
       
       if (!foundAgent) {
         res.status(401).json({ error: 'Credenciales inválidas' });
@@ -101,15 +66,14 @@ export class AuthController {
       
       // Actualizar estado del agente
       const { password: _, ...agentWithoutPassword } = foundAgent;
-      agentWithoutPassword.status = AgentStatus.ONLINE;
-      agentWithoutPassword.lastActivity = Date.now();
-      
-      // Guardar agente actualizado
-      agentsDB.set(foundAgent.id, {
+      const updatedAgent = {
         ...foundAgent,
         status: AgentStatus.ONLINE,
         lastActivity: Date.now()
-      });
+      };
+      
+      // Guardar agente actualizado
+      this.agentService.setAgent(updatedAgent);
       
       logger.info(`Inicio de sesión exitoso para ${email}`);
       
@@ -157,7 +121,7 @@ export class AuthController {
       }
       
       // Obtener agente
-      const agent = agentsDB.get(tokenData.agentId);
+      const agent = this.agentService.getAgentWithPasswordById(tokenData.agentId);
       
       if (!agent) {
         refreshTokens.delete(refreshToken);
@@ -189,7 +153,7 @@ export class AuthController {
       // Eliminar el refresh token anterior
       refreshTokens.delete(refreshToken);
       
-      // Actualizar última actividad del agente
+      // Preparar respuesta sin contraseña
       const { password: _, ...agentWithoutPassword } = agent;
       
       // Enviar respuesta
@@ -230,15 +194,17 @@ export class AuthController {
       
       // Obtener agente del token (si está autenticado)
       if (req.agent) {
-        const agent = agentsDB.get(req.agent.id);
+        const agent = this.agentService.getAgentWithPasswordById(req.agent.id);
         
         if (agent) {
           // Actualizar estado del agente
-          agentsDB.set(agent.id, {
+          const updatedAgent = {
             ...agent,
             status: AgentStatus.OFFLINE,
             lastActivity: Date.now()
-          });
+          };
+          
+          this.agentService.setAgent(updatedAgent);
           
           logger.info(`Cierre de sesión para ${agent.email}`);
         }
@@ -274,7 +240,7 @@ export class AuthController {
       }
       
       // Validar que el email no existe
-      const existingAgent = Array.from(agentsDB.values()).find(agent => agent.email === email);
+      const existingAgent = this.agentService.getAgentByEmail(email);
       
       if (existingAgent) {
         res.status(409).json({ error: 'Ya existe un agente con este email' });
@@ -305,8 +271,8 @@ export class AuthController {
         lastActivity: Date.now()
       };
       
-      // Guardar agente
-      agentsDB.set(newAgentId, newAgent);
+      // Guardar agente en el servicio
+      this.agentService.setAgent(newAgent);
       
       // Enviar respuesta sin la contraseña
       const { password: _, ...agentWithoutPassword } = newAgent;
@@ -336,7 +302,7 @@ export class AuthController {
       }
       
       // Obtener agente
-      const agent = agentsDB.get(req.agent.id);
+      const agent = this.agentService.getAgentWithPasswordById(req.agent.id);
       
       if (!agent) {
         res.status(404).json({ error: 'Agente no encontrado' });
@@ -355,10 +321,12 @@ export class AuthController {
       const hashedPassword = await bcrypt.hash(newPassword, 10);
       
       // Actualizar contraseña
-      agentsDB.set(agent.id, {
+      const updatedAgent = {
         ...agent,
         password: hashedPassword
-      });
+      };
+      
+      this.agentService.setAgent(updatedAgent);
       
       logger.info(`Contraseña cambiada para ${agent.email}`);
       res.json({ success: true, message: 'Contraseña actualizada correctamente' });

@@ -6,10 +6,12 @@ import { initNotificationService } from '../services/notification.service';
 import { AgentStatus } from '../models/agent.model';
 import logger from '../utils/logger';
 import { MessageSender } from '../models/message.model';
+import { initAgentService } from '../services/agent.service';
 
 // Servicios
 const queueService = initQueueService();
 const notificationService = initNotificationService();
+const agentService = initAgentService();
 
 /**
  * Manejar conexión WebSocket de un agente
@@ -144,15 +146,30 @@ function handleAgentStatusUpdate(
     return;
   }
   
-  // En una implementación real, aquí actualizaríamos el estado en la base de datos
-  // Por ahora solo respondemos con confirmación
-  
-  wsService.sendToAgent(agentId, 'agent:status:updated', {
-    status,
-    timestamp: Date.now()
-  });
-  
-  logger.info(`Estado del agente ${agentId} actualizado a ${status}`);
+  // Actualizar el estado del agente en el servicio
+  const agent = agentService.getAgentWithPasswordById(agentId);
+  if (agent) {
+    // Actualizar estado
+    const updatedAgent = {
+      ...agent,
+      status: status as AgentStatus,
+      lastActivity: Date.now()
+    };
+    
+    agentService.setAgent(updatedAgent);
+    
+    wsService.sendToAgent(agentId, 'agent:status:updated', {
+      status,
+      timestamp: Date.now()
+    });
+    
+    logger.info(`Estado del agente ${agentId} actualizado a ${status}`);
+  } else {
+    wsService.sendToAgent(agentId, 'error', {
+      message: 'Agente no encontrado',
+      timestamp: Date.now()
+    });
+  }
 }
 
 /**
@@ -243,6 +260,21 @@ function handleConversationAssign(
     
     // Obtener conversación actualizada
     const updatedConversation = queueService.getConversation(conversationId);
+    
+    // Actualizar estado del agente
+    const agent = agentService.getAgentWithPasswordById(agentId);
+    if (agent) {
+      const updatedAgent = {
+        ...agent,
+        activeConversations: [...agent.activeConversations, conversationId],
+        status: agent.activeConversations.length + 1 >= agent.maxConcurrentChats 
+          ? AgentStatus.BUSY 
+          : AgentStatus.ONLINE,
+        lastActivity: Date.now()
+      };
+      
+      agentService.setAgent(updatedAgent);
+    }
     
     // Notificar al agente
     wsService.sendToAgent(agentId, 'conversation:assigned', {
@@ -336,6 +368,17 @@ function handleMessageSend(
     // Obtener conversación actualizada
     const updatedConversation = queueService.getConversation(conversationId);
     
+    // Actualizar última actividad del agente
+    const agent = agentService.getAgentWithPasswordById(agentId);
+    if (agent) {
+      const updatedAgent = {
+        ...agent,
+        lastActivity: Date.now()
+      };
+      
+      agentService.setAgent(updatedAgent);
+    }
+    
     // Notificar actualización de la conversación
     if (updatedConversation) {
       wsService.sendToAgent(agentId, 'conversation:updated', {
@@ -382,6 +425,19 @@ function handleConversationComplete(
         timestamp: Date.now()
       });
       return;
+    }
+    
+    // Actualizar estado del agente
+    const agent = agentService.getAgentWithPasswordById(agentId);
+    if (agent) {
+      const updatedAgent = {
+        ...agent,
+        activeConversations: agent.activeConversations.filter(id => id !== conversationId),
+        status: agent.activeConversations.length <= 1 ? AgentStatus.ONLINE : AgentStatus.BUSY,
+        lastActivity: Date.now()
+      };
+      
+      agentService.setAgent(updatedAgent);
     }
     
     // Completar conversación

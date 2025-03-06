@@ -18,6 +18,7 @@ import { requestLogger } from './middleware/logging.middleware';
 // Services
 import { setupWebSocketServer } from './websocket/server';
 import { initQueueService } from './services/queue.service';
+import { initAgentService } from './services/agent.service';
 
 class App {
   public app: Application;
@@ -28,6 +29,9 @@ class App {
     this.app = express();
     this.port = process.env.PORT || 3000;
 
+    // Inicializar servicios
+    initAgentService();
+    
     this.initializeMiddlewares();
     this.initializeRoutes();
     this.initializeErrorHandling();

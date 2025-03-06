@@ -1,0 +1,76 @@
+[
+  {
+    "conversationId": "5212411734121",
+    "from": "5212411734121",
+    "phone_number_id": "472700542602683",
+    "assignedAgent": null,
+    "metadata": {
+      "escalationReason": "La remisión a un agente por chat no está configurada actualmente para este bot. Sin embargo, aquí es donde el bot podría proporcionar información sobre cómo ponerse en contacto con alguien de otra manera."
+    },
+    "startTime": 1741195690106,
+    "priority": 1,
+    "tags": [],
+    "id": "7e49e930-4691-43c2-9ee1-f8dfb22a4fa3"
+  },
+  {
+    "conversationId": "5212411734121",
+    "from": "5212411734121",
+    "phone_number_id": "472700542602683",
+    "assignedAgent": "admin_test_1",
+    "metadata": {
+      "escalationReason": "La remisión a un agente por chat no está configurada actualmente para este bot. Sin embargo, aquí es donde el bot podría proporcionar información sobre cómo ponerse en contacto con alguien de otra manera."
+    },
+    "startTime": 1741201323611,
+    "priority": 1,
+    "tags": [],
+    "id": "46700191-9c7d-48f9-973b-260cad0864c5"
+  },
+  {
+    "conversationId": "5212411734121",
+    "from": "5212411734121",
+    "phone_number_id": "472700542602683",
+    "assignedAgent": "agent_test_1",
+    "metadata": {
+      "escalationReason": "La remisión a un agente por chat no está configurada actualmente para este bot. Sin embargo, aquí es donde el bot podría proporcionar información sobre cómo ponerse en contacto con alguien de otra manera."
+    },
+    "startTime": 1741206361114,
+    "priority": 1,
+    "tags": [],
+    "id": "3d12f804-51e8-4d9e-9478-7596ad3226a5"
+  },
+  {
+    "conversationId": "5212411734121",
+    "from": "5212411734121",
+    "phone_number_id": "472700542602683",
+    "assignedAgent": null,
+    "metadata": {
+      "escalationReason": "La remisión a un agente por chat no está configurada actualmente para este bot. Sin embargo, aquí es donde el bot podría proporcionar información sobre cómo ponerse en contacto con alguien de otra manera."
+    },
+    "startTime": 1741277612886,
+    "messages": [
+      {
+        "id": "msg_1741277612887_9eixtgujp",
+        "conversationId": "5212411734121",
+        "from": "bot",
+        "text": "La remisión a un agente por chat no está configurada actualmente para este bot. Sin embargo, aquí es donde el bot podría proporcionar información sobre cómo ponerse en contacto con alguien de otra manera.",
+        "timestamp": 1741277612887
+      }
+    ],
+    "priority": 1,
+    "tags": [],
+    "id": "0f7fe4cb-0a74-419a-be80-f8779774d642"
+  },
+  {
+    "conversationId": "5212411734121",
+    "from": "5212411734121",
+    "phone_number_id": "472700542602683",
+    "assignedAgent": "agent_test_1",
+    "metadata": {
+      "escalationReason": "La remisión a un agente por chat no está configurada actualmente para este bot. Sin embargo, aquí es donde el bot podría proporcionar información sobre cómo ponerse en contacto con alguien de otra manera."
+    },
+    "startTime": 1741277612886,
+    "priority": 1,
+    "tags": [],
+    "id": "71526b75-69c0-453a-857a-fa3bca2e4645"
+  }
+]

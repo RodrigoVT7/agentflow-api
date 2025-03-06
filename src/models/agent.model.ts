@@ -14,5 +14,6 @@ export enum AgentStatus {
     maxConcurrentChats: number;
     role: 'agent' | 'supervisor' | 'admin';
     lastActivity: number;
+    password?: string;
     socketId?: string;
   }
