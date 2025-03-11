@@ -19,6 +19,9 @@ import { requestLogger } from './middleware/logging.middleware';
 import { setupWebSocketServer } from './websocket/server';
 import { initQueueService } from './services/queue.service';
 import { initAgentService } from './services/agent.service';
+import { initConversationService } from './services/conversation.service';
+import { initDatabaseConnection, closeDatabaseConnection } from './database/connection';
+import logger from './utils/logger';
 
 class App {
   public app: Application;
@@ -29,13 +32,42 @@ class App {
     this.app = express();
     this.port = process.env.PORT || 3000;
 
-    // Inicializar servicios
-    initAgentService();
+    // Inicializar base de datos SQLite
+    this.initializeDatabase();
     
+    // Inicializar servicios
+    this.initializeServices();
+    
+    // Inicializar middleware y rutas
     this.initializeMiddlewares();
     this.initializeRoutes();
     this.initializeErrorHandling();
     this.setupStaticFiles();
+  }
+
+  /**
+   * Inicializar la conexión a la base de datos SQLite
+   */
+  private async initializeDatabase(): Promise<void> {
+    try {
+      await initDatabaseConnection();
+      logger.info('SQLite inicializada correctamente');
+    } catch (error) {
+      logger.error('Error al inicializar SQLite', { error });
+      process.exit(1);
+    }
+  }
+
+  /**
+   * Inicializar los servicios principales
+   */
+  private initializeServices(): void {
+    // La inicialización debe seguir este orden para evitar dependencias circulares
+    const agentService = initAgentService();
+    const queueService = initQueueService();
+    const conversationService = initConversationService();
+    
+    logger.info('Servicios inicializados correctamente');
   }
 
   private initializeMiddlewares(): void {
@@ -76,10 +108,11 @@ class App {
     });
     
     // Inicializar WebSocket Server
-    setupWebSocketServer(this.server);
+    const wsService = setupWebSocketServer(this.server);
     
-    // Inicializar el servicio de cola
-    initQueueService();
+    // Conectar servicios con WebSocket
+    const queueService = initQueueService();
+    queueService.setWebSocketService(wsService);
     
     // Manejo de cierre limpio
     this.setupGracefulShutdown();
@@ -96,11 +129,11 @@ class App {
     });
   }
 
-  private gracefulShutdown(signal: string): void {
+  private async gracefulShutdown(signal: string): Promise<void> {
     console.log(`${signal} recibido. Cerrando servidor...`);
     
-    // Guardar estado de colas antes de cerrar
-    initQueueService().saveQueueState();
+    // Cerrar conexiones de base de datos
+    await closeDatabaseConnection();
     
     this.server.close(() => {
       console.log('Servidor cerrado correctamente');

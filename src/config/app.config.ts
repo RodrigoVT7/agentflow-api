@@ -14,6 +14,7 @@ interface AppConfig {
   };
   directline: {
     url: string;
+    tokenRefreshMinutes: number;
   };
   powerPlatform: {
     baseUrl: string;
@@ -22,14 +23,15 @@ interface AppConfig {
   auth: {
     jwtSecret: string;
     jwtExpiresIn: string;
-    refreshTokenExpiresIn: string;
   };
-  storage: {
-    queuePath: string;
+  database: {
+    path: string;
   };
-  cors: {
-    origin: string | string[];
-    methods: string[];
+  conversation: {
+    // Tiempo de inactividad para cerrar conversación (24 horas en milisegundos)
+    inactivityTimeout: number;
+    // Intervalo para revisar conversaciones inactivas (1 hora en milisegundos)
+    cleanupInterval: number;
   };
 }
 
@@ -43,6 +45,7 @@ const config: AppConfig = {
   },
   directline: {
     url: process.env.DIRECTLINE_URL || 'https://directline.botframework.com/v3/directline',
+    tokenRefreshMinutes: parseInt(process.env.DIRECTLINE_TOKEN_REFRESH_MINUTES || '30', 10),
   },
   powerPlatform: {
     baseUrl: process.env.BASE_URL || '',
@@ -51,15 +54,14 @@ const config: AppConfig = {
   auth: {
     jwtSecret: process.env.JWT_SECRET || 'super-secret-key-change-in-production',
     jwtExpiresIn: process.env.JWT_EXPIRES_IN || '1h',
-    refreshTokenExpiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || '7d',
   },
-  storage: {
-    queuePath: process.env.QUEUE_STORAGE_PATH || path.join(__dirname, '../../data/queues_state.json'),
+  database: {
+    path: process.env.DATABASE_PATH || path.join(__dirname, '../../data/database.sqlite'),
   },
-  cors: {
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  },
+  conversation: {
+    inactivityTimeout: 24 * 60 * 60 * 1000, // 24 horas en milisegundos
+    cleanupInterval: 60 * 60 * 1000, // 1 hora en milisegundos
+  }
 };
 
 // Validación de configuración crítica

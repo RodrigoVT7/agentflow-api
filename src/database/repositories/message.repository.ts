@@ -1,9 +1,8 @@
 // src/database/repositories/message.repository.ts
-import { MemoryRepository } from './memory.repository';
+import { SQLiteBatchRepository } from './sqlite-batch.repository';
 import { Message } from '../../models/message.model';
 import { IBatchRepository } from './base.repository';
-import path from 'path';
-import dbConfig, { DatabaseType } from '../../config/database.config';
+import logger from '../../utils/logger';
 
 /**
  * Repositorio para gestión de mensajes
@@ -12,15 +11,9 @@ export class MessageRepository implements IBatchRepository<Message> {
   private repository: IBatchRepository<Message>;
 
   constructor() {
-    switch (dbConfig.type) {
-      case DatabaseType.MEMORY:
-      default:
-        this.repository = new MemoryRepository<Message>(
-          'messages',
-          path.join(__dirname, '../../../data/messages.json')
-        );
-        break;
-    }
+    // Inicializar el repositorio SQLite con operaciones batch y campo ID personalizado
+    this.repository = new SQLiteBatchRepository<Message>('messages', 'id');
+    logger.debug('MessageRepository inicializado con SQLite');
   }
 
   async create(data: Message): Promise<Message> {

@@ -4,155 +4,77 @@ import { QueueItem } from '../models/queue.model';
 import { Message, MessageSender } from '../models/message.model';
 import { ConversationStatus } from '../models/conversation.model';
 import { WebSocketService } from '../websocket/server';
-import { QueueRepository } from '../database/repositories/queue.repository';
-import { MessageRepository } from '../database/repositories/message.repository';
 import logger from '../utils/logger';
-import fs from 'fs';
-import path from 'path';
-import config from '../config/app.config';
+import { initDatabaseConnection } from '../database/connection';
+import { v4 as uuidv4 } from 'uuid';
 
 class QueueService {
   private agentQueues: Map<string, QueueItem>;
   private events: EventEmitter;
-  private queueRepository: QueueRepository;
-  private messageRepository: MessageRepository;
   private webSocketService?: WebSocketService;
 
   constructor() {
     this.agentQueues = new Map<string, QueueItem>();
     this.events = new EventEmitter();
-    this.queueRepository = new QueueRepository();
-    this.messageRepository = new MessageRepository();
     
-    // Cargar estado inicial
+    // Cargar estado inicial desde SQLite
     this.loadInitialState();
-    
-    // Configurar guardado periódico
-    setInterval(() => this.saveQueueState(), 5 * 60 * 1000); // cada 5 minutos
   }
 
   /**
-   * Cargar estado inicial de la cola desde la base de datos o archivo
+   * Cargar estado inicial de la cola desde SQLite
    */
   private async loadInitialState(): Promise<void> {
     try {
-      // Intentar cargar de la base de datos primero
-      const queueItems = await this.queueRepository.findAll();
+      const db = await initDatabaseConnection();
+      
+      // Obtener conversaciones en cola
+      const queueItems = await db.all('SELECT * FROM queue');
       
       if (queueItems && queueItems.length > 0) {
-        // Llenar el mapa en memoria desde la base de datos
+        // Limpiar el mapa actual
+        this.agentQueues.clear();
+        
         for (const item of queueItems) {
           // Cargar los mensajes asociados a esta conversación
-          const messages = await this.messageRepository.findByConversation(item.conversationId);
+          const messages = await db.all(
+            'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
+            [item.conversationId]
+          );
           
-          // Actualizar con los mensajes más recientes
-          const queueItemWithMessages = {
-            ...item,
-            messages: messages || []
+          // Convertir las cadenas JSON a objetos
+          const tags = item.tags ? JSON.parse(item.tags) : [];
+          const metadata = item.metadata ? JSON.parse(item.metadata) : {};
+          
+          // Crear objeto de cola en memoria
+          const queueItem: QueueItem = {
+            conversationId: item.conversationId,
+            from: item.from_number,
+            phone_number_id: item.phone_number_id,
+            startTime: item.startTime,
+            priority: item.priority,
+            tags: tags,
+            assignedAgent: item.assignedAgent || null,
+            messages: messages.map((msg: any) => ({
+              id: msg.id,
+              conversationId: msg.conversationId,
+              from: msg.from_type as MessageSender,
+              text: msg.text,
+              timestamp: msg.timestamp,
+              agentId: msg.agentId || undefined,
+              attachmentUrl: msg.attachmentUrl || undefined,
+              metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
+            })),
+            metadata: metadata
           };
           
-          this.agentQueues.set(item.conversationId, queueItemWithMessages);
+          this.agentQueues.set(item.conversationId, queueItem);
         }
-        logger.info(`Cargadas ${queueItems.length} conversaciones en cola desde la base de datos`);
-      } else {
-        // Si no hay datos en la base de datos, intentar cargar desde el archivo
-        this.loadFromFile();
-      }
-    } catch (error) {
-      logger.error('Error al cargar estado inicial de cola desde la base de datos', { error });
-      // Si hay error al cargar desde la base de datos, intentar cargar desde el archivo
-      this.loadFromFile();
-    }
-  }
-
-  /**
-   * Cargar estado desde archivo
-   */
-  private loadFromFile(): void {
-    try {
-      const filePath = config.storage.queuePath;
-      
-      if (fs.existsSync(filePath)) {
-        const data = fs.readFileSync(filePath, 'utf8');
-        const queueData = JSON.parse(data);
         
-        if (Array.isArray(queueData)) {
-          // Limpiar mapa actual
-          this.agentQueues.clear();
-          
-          // Cargar datos
-          queueData.forEach(item => {
-            if (item.conversationId) {
-              this.agentQueues.set(item.conversationId, item);
-            }
-          });
-          
-          logger.info(`Cargadas ${this.agentQueues.size} conversaciones en cola desde archivo`);
-        }
+        logger.info(`Cargadas ${queueItems.length} conversaciones en cola desde SQLite`);
       }
     } catch (error) {
-      logger.error('Error al cargar estado de cola desde archivo', { error });
-    }
-  }
-
-  /**
-   * Guardar estado actual en la base de datos y archivo
-   */
-  public async saveQueueState(): Promise<void> {
-    try {
-      // Guardar en base de datos
-      const updatePromises: Promise<QueueItem | null>[] = [];
-      
-      for (const [id, item] of this.agentQueues.entries()) {
-        // No guardar los mensajes en la tabla de cola para evitar duplicación
-        const { messages, ...queueItemWithoutMessages } = item;
-        
-        // Actualizar o crear en la base de datos
-        updatePromises.push(
-          this.queueRepository.update(id, queueItemWithoutMessages as QueueItem)
-            .then(updated => {
-              if (!updated) {
-                // Si no existe, crear nuevo
-                return this.queueRepository.create(queueItemWithoutMessages as QueueItem);
-              }
-              return updated;
-            })
-        );
-      }
-      
-      await Promise.all(updatePromises);
-      
-      // Guardar también en archivo como respaldo
-      this.saveToFile();
-      
-      logger.info(`Estado de cola guardado (${this.agentQueues.size} conversaciones)`);
-    } catch (error) {
-      logger.error('Error al guardar estado de cola en base de datos', { error });
-      // Si hay error al guardar en la base de datos, al menos intentar guardar en archivo
-      this.saveToFile();
-    }
-  }
-
-  /**
-   * Guardar estado en archivo
-   */
-  private saveToFile(): void {
-    try {
-      const filePath = config.storage.queuePath;
-      
-      // Asegurar que el directorio existe
-      const dir = path.dirname(filePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      
-      // Guardar datos
-      const queueData = Array.from(this.agentQueues.values());
-      fs.writeFileSync(filePath, JSON.stringify(queueData, null, 2), 'utf8');
-      
-      logger.debug(`Estado de cola guardado en archivo: ${filePath}`);
-    } catch (error) {
-      logger.error('Error al guardar estado de cola en archivo', { error });
+      logger.error('Error al cargar estado inicial de cola desde SQLite', { error });
     }
   }
 
@@ -173,11 +95,28 @@ class QueueService {
     this.agentQueues.set(queueItem.conversationId, newQueueItem);
     
     try {
-      // Guardar en base de datos
-      await this.queueRepository.create(newQueueItem);
+      // Guardar en SQLite
+      const db = await initDatabaseConnection();
       
-      // Guardar estado completo
-      await this.saveQueueState();
+      // Convertir arrays y objetos a JSON para almacenar
+      const tagsJson = JSON.stringify(newQueueItem.tags);
+      const metadataJson = JSON.stringify(newQueueItem.metadata);
+      
+      await db.run(
+        `INSERT INTO queue
+         (conversationId, from_number, phone_number_id, startTime, priority, tags, assignedAgent, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          newQueueItem.conversationId,
+          newQueueItem.from,
+          newQueueItem.phone_number_id,
+          newQueueItem.startTime,
+          newQueueItem.priority,
+          tagsJson,
+          newQueueItem.assignedAgent,
+          metadataJson
+        ]
+      );
       
       // Notificar a los agentes disponibles
       this.notifyQueueUpdated();
@@ -211,14 +150,21 @@ class QueueService {
     queueItem.assignedAgent = agentId;
     
     try {
-      // Actualizar en base de datos
-      await this.queueRepository.update(conversationId, { assignedAgent: agentId });
+      // Actualizar en SQLite
+      const db = await initDatabaseConnection();
+      await db.run(
+        'UPDATE queue SET assignedAgent = ? WHERE conversationId = ?',
+        [agentId, conversationId]
+      );
+      
+      // Actualizar estado de la conversación
+      await db.run(
+        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?',
+        [ConversationStatus.ASSIGNED, Date.now(), conversationId]
+      );
       
       // Añadir mensaje de sistema
       await this.addSystemMessage(conversationId, `Agente ${agentId} se ha unido a la conversación`);
-      
-      // Guardar estado completo
-      await this.saveQueueState();
       
       // Notificar actualización
       this.notifyQueueUpdated();
@@ -248,13 +194,16 @@ class QueueService {
     this.agentQueues.delete(conversationId);
     
     try {
-      // Eliminar de la base de datos
-      await this.queueRepository.delete(conversationId);
+      const db = await initDatabaseConnection();
       
-      // Guardar estado actualizado
-      await this.saveQueueState();
+      // Actualizar estado en la base de datos (no eliminar para mantener historial)
+      await db.run(
+        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?',
+        [ConversationStatus.COMPLETED, Date.now(), conversationId]
+      );
       
-      // No eliminamos los mensajes de la base de datos para mantener historial
+      // Eliminar de la cola
+      await db.run('DELETE FROM queue WHERE conversationId = ?', [conversationId]);
       
       // Notificar actualización
       this.notifyQueueUpdated();
@@ -301,8 +250,33 @@ class QueueService {
     queueItem.messages.push(newMessage);
     
     try {
-      // Guardar en base de datos
-      await this.messageRepository.create(newMessage);
+      // Guardar en SQLite
+      const db = await initDatabaseConnection();
+      
+      // Convertir metadata a JSON si existe
+      const metadataJson = newMessage.metadata ? JSON.stringify(newMessage.metadata) : null;
+      
+      await db.run(
+        `INSERT INTO messages
+         (id, conversationId, from_type, text, timestamp, agentId, attachmentUrl, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          newMessage.id,
+          newMessage.conversationId,
+          newMessage.from,
+          newMessage.text,
+          newMessage.timestamp,
+          newMessage.agentId || null,
+          newMessage.attachmentUrl || null,
+          metadataJson
+        ]
+      );
+      
+      // Actualizar timestamp de actividad en la conversación
+      await db.run(
+        'UPDATE conversations SET lastActivity = ? WHERE conversationId = ?',
+        [Date.now(), conversationId]
+      );
       
       // Notificar actualización
       this.notifyConversationUpdated(conversationId);
@@ -359,8 +333,28 @@ class QueueService {
       return queueItem.messages;
     }
     
-    // Si no está en memoria, buscar en la base de datos
-    return this.messageRepository.findByConversation(conversationId);
+    // Si no está en memoria, buscar en SQLite
+    try {
+      const db = await initDatabaseConnection();
+      const messages = await db.all(
+        'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
+        [conversationId]
+      );
+      
+      return messages.map((msg: any) => ({
+        id: msg.id,
+        conversationId: msg.conversationId,
+        from: msg.from_type as MessageSender,
+        text: msg.text,
+        timestamp: msg.timestamp,
+        agentId: msg.agentId || undefined,
+        attachmentUrl: msg.attachmentUrl || undefined,
+        metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
+      }));
+    } catch (error) {
+      logger.error(`Error al obtener mensajes desde SQLite: ${conversationId}`, { error });
+      return [];
+    }
   }
 
   /**
@@ -384,8 +378,12 @@ class QueueService {
     queueItem.priority = priority;
     
     try {
-      // Actualizar en base de datos
-      await this.queueRepository.update(conversationId, { priority });
+      // Actualizar en SQLite
+      const db = await initDatabaseConnection();
+      await db.run(
+        'UPDATE queue SET priority = ? WHERE conversationId = ?',
+        [priority, conversationId]
+      );
       
       // Añadir mensaje de sistema si la prioridad es alta
       if (priority >= 3) {
@@ -394,9 +392,6 @@ class QueueService {
           `Prioridad actualizada a ${priority} (${priority >= 4 ? 'Urgente' : 'Alta'})`
         );
       }
-      
-      // Guardar estado completo
-      await this.saveQueueState();
       
       // Notificar actualización
       this.notifyQueueUpdated();
@@ -425,11 +420,14 @@ class QueueService {
     queueItem.tags = tags;
     
     try {
-      // Actualizar en base de datos
-      await this.queueRepository.update(conversationId, { tags });
+      // Actualizar en SQLite
+      const db = await initDatabaseConnection();
+      const tagsJson = JSON.stringify(tags);
       
-      // Guardar estado completo
-      await this.saveQueueState();
+      await db.run(
+        'UPDATE queue SET tags = ? WHERE conversationId = ?',
+        [tagsJson, conversationId]
+      );
       
       // Notificar actualización
       this.notifyQueueUpdated();
@@ -461,13 +459,14 @@ class QueueService {
     };
     
     try {
-      // Actualizar en base de datos
-      await this.queueRepository.update(conversationId, { 
-        metadata: queueItem.metadata 
-      });
+      // Actualizar en SQLite
+      const db = await initDatabaseConnection();
+      const metadataJson = JSON.stringify(queueItem.metadata);
       
-      // Guardar estado completo
-      await this.saveQueueState();
+      await db.run(
+        'UPDATE queue SET metadata = ? WHERE conversationId = ?',
+        [metadataJson, conversationId]
+      );
       
       logger.debug(`Metadata de conversación ${conversationId} actualizada`);
       

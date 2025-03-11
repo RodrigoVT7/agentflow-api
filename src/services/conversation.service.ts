@@ -7,6 +7,8 @@ import { WhatsAppService } from './whatsapp.service';
 import { initQueueService } from './queue.service';
 import { MessageSender } from '../models/message.model';
 import config from '../config/app.config';
+import logger from '../utils/logger';
+import { initDatabaseConnection } from '../database/connection';
 
 class ConversationService {
   private conversations: Map<string, ConversationData>;
@@ -28,16 +30,90 @@ class ConversationService {
     this.conversations = new Map<string, ConversationData>();
     this.whatsappService = new WhatsAppService();
     
-    // Iniciar limpieza periódica de conversaciones inactivas
-    setInterval(() => this.cleanupInactiveConversations(), 15 * 60 * 1000);
+    // Cargar conversaciones activas desde la base de datos
+    this.loadConversationsFromDB().catch(error => {
+      logger.error('Error al cargar conversaciones desde la base de datos', { error });
+    });
+    
+    // Iniciar limpieza periódica de conversaciones inactivas (cada hora)
+    setInterval(() => this.cleanupInactiveConversations(), 60 * 60 * 1000);
+  }
+
+  /**
+   * Cargar conversaciones activas desde la base de datos
+   */
+  private async loadConversationsFromDB(): Promise<void> {
+    try {
+      const db = await initDatabaseConnection();
+      
+      // Obtener conversaciones activas (no completadas)
+      const dbConversations = await db.all(
+        `SELECT * FROM conversations WHERE status != ?`, 
+        [ConversationStatus.COMPLETED]
+      );
+      
+      if (dbConversations && dbConversations.length > 0) {
+        for (const dbConv of dbConversations) {
+          // Solo cargar en memoria las conversaciones recientes (menos de 24 horas)
+          const lastActivity = dbConv.lastActivity;
+          const now = Date.now();
+          
+          // Si la conversación tiene más de 24 horas de inactividad, marcarla como completada
+          if (now - lastActivity > 24 * 60 * 60 * 1000) {
+            await db.run(
+              `UPDATE conversations SET status = ? WHERE conversationId = ?`,
+              [ConversationStatus.COMPLETED, dbConv.conversationId]
+            );
+            continue;
+          }
+          
+          // Cargar conversación activa en memoria
+          const conversation: ConversationData = {
+            conversationId: dbConv.conversationId,
+            token: dbConv.token,
+            phone_number_id: dbConv.phone_number_id,
+            from: dbConv.from_number,
+            isEscalated: dbConv.isEscalated === 1,
+            lastActivity: dbConv.lastActivity,
+            status: dbConv.status as ConversationStatus
+          };
+          
+          this.conversations.set(dbConv.from_number, conversation);
+        }
+        
+        logger.info(`${this.conversations.size} conversaciones activas cargadas desde la base de datos`);
+      }
+    } catch (error) {
+      logger.error('Error al cargar conversaciones desde la base de datos', { error });
+    }
   }
 
   /**
    * Obtener o crear una conversación para un usuario
    */
   public async getOrCreateConversation(from: string, phone_number_id: string): Promise<ConversationData> {
-    // Verificar si ya existe la conversación
+    // Verificar si ya existe la conversación activa
     let conversation = this.conversations.get(from);
+    
+    // Si existe pero está inactiva por más de 24 horas, crear una nueva conversación
+    if (conversation && Date.now() - conversation.lastActivity > 24 * 60 * 60 * 1000) {
+      logger.info(`Conversación inactiva para ${from}, creando una nueva`);
+      
+      // Marcar la conversación antigua como completada en la base de datos
+      try {
+        const db = await initDatabaseConnection();
+        await db.run(
+          `UPDATE conversations SET status = ? WHERE from_number = ? AND status != ?`,
+          [ConversationStatus.COMPLETED, from, ConversationStatus.COMPLETED]
+        );
+      } catch (error) {
+        logger.error(`Error al marcar conversación antigua como completada: ${from}`, { error });
+      }
+      
+      // Eliminar de la memoria para que se cree una nueva
+      this.conversations.delete(from);
+      conversation = undefined;
+    }
     
     if (!conversation) {
       // Crear una nueva conversación con DirectLine
@@ -64,6 +140,29 @@ class ConversationService {
       };
       
       this.conversations.set(from, conversation);
+      
+      // Persistir en la base de datos
+      try {
+        const db = await initDatabaseConnection();
+        await db.run(
+          `INSERT INTO conversations 
+           (conversationId, token, phone_number_id, from_number, isEscalated, lastActivity, status) 
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            conversation.conversationId,
+            conversation.token,
+            conversation.phone_number_id,
+            conversation.from,
+            conversation.isEscalated ? 1 : 0,
+            conversation.lastActivity,
+            conversation.status
+          ]
+        );
+        
+        logger.info(`Nueva conversación creada y persistida para ${from}`);
+      } catch (error) {
+        logger.error(`Error al persistir nueva conversación: ${from}`, { error });
+      }
     }
     
     return conversation;
@@ -144,7 +243,13 @@ class ConversationService {
                 from,
                 botResponse.text
               );
+              
+              // Guardar el mensaje del bot en la base de datos
+              this.saveMessage(from, 'bot', botResponse.text);
             }
+            
+            // Actualizar timestamp de actividad
+            this.updateConversationActivity(from);
           }
         }
       } catch (error) {
@@ -160,6 +265,49 @@ class ConversationService {
   }
 
   /**
+   * Guardar mensaje en la base de datos
+   */
+  private async saveMessage(conversationId: string, from: string, text: string, agentId?: string): Promise<void> {
+    try {
+      const messageId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      const timestamp = Date.now();
+      
+      const db = await initDatabaseConnection();
+      await db.run(
+        `INSERT INTO messages (id, conversationId, from_type, text, timestamp, agentId)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [messageId, conversationId, from, text, timestamp, agentId || null]
+      );
+      
+      logger.debug(`Mensaje guardado en base de datos: ${messageId}`);
+    } catch (error) {
+      logger.error(`Error al guardar mensaje en base de datos: ${conversationId}`, { error });
+    }
+  }
+
+  /**
+   * Actualizar timestamp de actividad de una conversación
+   */
+  private async updateConversationActivity(from: string): Promise<void> {
+    const conversation = this.conversations.get(from);
+    if (!conversation) return;
+    
+    // Actualizar en memoria
+    conversation.lastActivity = Date.now();
+    
+    // Actualizar en base de datos
+    try {
+      const db = await initDatabaseConnection();
+      await db.run(
+        `UPDATE conversations SET lastActivity = ? WHERE conversationId = ?`,
+        [conversation.lastActivity, conversation.conversationId]
+      );
+    } catch (error) {
+      logger.error(`Error al actualizar timestamp de actividad: ${from}`, { error });
+    }
+  }
+
+  /**
    * Enviar mensaje a la conversación
    */
   public async sendMessage(from: string, phone_number_id: string, message: string): Promise<void> {
@@ -170,6 +318,10 @@ class ConversationService {
         from: MessageSender.USER,
         text: message
       });
+      
+      // Guardar mensaje en la base de datos
+      await this.saveMessage(from, 'user', message);
+      
       return;
     }
     
@@ -178,6 +330,10 @@ class ConversationService {
     
     // Actualizar tiempo de actividad
     conversation.lastActivity = Date.now();
+    this.updateConversationActivity(from);
+    
+    // Guardar mensaje en la base de datos
+    await this.saveMessage(from, 'user', message);
     
     // Enviar mensaje al bot
     const response = await fetch(`${config.directline.url}/conversations/${conversation.conversationId}/activities`, {
@@ -219,6 +375,9 @@ class ConversationService {
     const escalationMsg = "Tu conversación ha sido transferida a un agente. Pronto te atenderán.";
     await this.whatsappService.sendMessage(phone_number_id, from, escalationMsg);
     
+    // Guardar mensaje de sistema en la base de datos
+    await this.saveMessage(from, 'system', escalationMsg);
+    
     // Añadir a la cola de agentes
     this.queueService.addToQueue({
       conversationId: from,
@@ -235,6 +394,11 @@ class ConversationService {
       from: MessageSender.BOT,
       text: botMessage
     });
+    
+    // Guardar mensaje del bot en la base de datos
+    await this.saveMessage(from, 'bot', botMessage);
+    
+    logger.info(`Conversación escalada a agente: ${from}`);
   }
 
   /**
@@ -248,13 +412,34 @@ class ConversationService {
   /**
    * Actualizar estado de escalamiento de una conversación
    */
-  public updateConversationStatus(from: string, isEscalated: boolean): void {
+  public async updateConversationStatus(from: string, isEscalated: boolean): Promise<void> {
     const conversation = this.conversations.get(from);
     
     if (conversation) {
+      // Actualizar en memoria
       conversation.isEscalated = isEscalated;
       conversation.status = isEscalated ? ConversationStatus.WAITING : ConversationStatus.BOT;
       conversation.lastActivity = Date.now();
+      
+      // Actualizar en base de datos
+      try {
+        const db = await initDatabaseConnection();
+        await db.run(
+          `UPDATE conversations 
+           SET isEscalated = ?, status = ?, lastActivity = ? 
+           WHERE conversationId = ?`,
+          [
+            isEscalated ? 1 : 0,
+            conversation.status,
+            conversation.lastActivity,
+            conversation.conversationId
+          ]
+        );
+        
+        logger.info(`Estado de conversación actualizado: ${from}, escalada: ${isEscalated}`);
+      } catch (error) {
+        logger.error(`Error al actualizar estado de conversación: ${from}`, { error });
+      }
     }
   }
 
@@ -273,49 +458,99 @@ class ConversationService {
     conversation.status = ConversationStatus.BOT;
     conversation.lastActivity = Date.now();
     
+    // Actualizar en base de datos
+    try {
+      const db = await initDatabaseConnection();
+      await db.run(
+        `UPDATE conversations 
+         SET isEscalated = 0, status = ?, lastActivity = ? 
+         WHERE conversationId = ?`,
+        [conversation.status, conversation.lastActivity, conversation.conversationId]
+      );
+    } catch (error) {
+      logger.error(`Error al actualizar estado de conversación completada: ${from}`, { error });
+    }
+    
     // Eliminar de la cola de agentes
-    const completed = this.queueService.completeConversation(from);
+    const completed = await this.queueService.completeConversation(from);
     
     // Enviar mensaje de finalización
-    if (await completed) {
+    if (completed) {
+      const completionMessage = "La conversación con el agente ha finalizado. ¿En qué más puedo ayudarte?";
+      
       await this.whatsappService.sendMessage(
         conversation.phone_number_id,
         from,
-        "La conversación con el agente ha finalizado. ¿En qué más puedo ayudarte?"
+        completionMessage
       );
+      
+      // Guardar mensaje de sistema en la base de datos
+      await this.saveMessage(from, 'system', completionMessage);
+      
+      logger.info(`Conversación con agente finalizada: ${from}`);
     }
     
     return completed;
   }
 
   /**
-   * Limpiar conversaciones inactivas
+   * Limpiar conversaciones inactivas (24 horas)
    */
-  private cleanupInactiveConversations(): void {
-    const INACTIVE_TIMEOUT = 30 * 60 * 1000; // 30 minutos
+  private async cleanupInactiveConversations(): Promise<void> {
+    const INACTIVE_TIMEOUT = 24 * 60 * 60 * 1000; // 24 horas en milisegundos
+    const now = Date.now();
     
     for (const [from, conversation] of this.conversations.entries()) {
-      if (Date.now() - conversation.lastActivity > INACTIVE_TIMEOUT) {
+      if (now - conversation.lastActivity > INACTIVE_TIMEOUT) {
+        logger.info(`Cerrando conversación inactiva (24h): ${from}`);
+        
         // Cerrar WebSocket si existe
         if (conversation.wsConnection) {
           try {
             conversation.wsConnection.close();
           } catch (error) {
-            console.error(`Error al cerrar WebSocket para ${from}:`, error);
+            logger.error(`Error al cerrar WebSocket para ${from}:`, { error });
           }
         }
         
-        // Eliminar conversación
-        this.conversations.delete(from);
-        
-        // Si estaba escalada, eliminar de la cola de agentes
+        // Si estaba escalada, completar en la cola de agentes
         if (conversation.isEscalated) {
-          this.queueService.completeConversation(from);
+          await this.queueService.completeConversation(from);
         }
         
-        console.log(`Conversación inactiva eliminada: ${from}`);
+        // Enviar mensaje al usuario sobre cierre por inactividad
+        try {
+          const timeoutMessage = "Tu conversación ha sido cerrada automáticamente debido a inactividad (24 horas). Si necesitas ayuda nuevamente, envía un nuevo mensaje.";
+          
+          await this.whatsappService.sendMessage(
+            conversation.phone_number_id,
+            from,
+            timeoutMessage
+          );
+          
+          // Guardar mensaje de sistema en la base de datos
+          await this.saveMessage(from, 'system', timeoutMessage);
+        } catch (error) {
+          logger.error(`Error al enviar mensaje de cierre por inactividad: ${from}`, { error });
+        }
+        
+        // Marcar como completada en la base de datos
+        try {
+          const db = await initDatabaseConnection();
+          await db.run(
+            `UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?`,
+            [ConversationStatus.COMPLETED, now, conversation.conversationId]
+          );
+        } catch (error) {
+          logger.error(`Error al marcar conversación como completada: ${from}`, { error });
+        }
+        
+        // Eliminar de la memoria
+        this.conversations.delete(from);
       }
     }
+    
+    logger.info('Limpieza de conversaciones inactivas completada');
   }
 }
 

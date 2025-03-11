@@ -1,10 +1,8 @@
 // src/database/repositories/conversation.repository.ts
-
-import { MemoryRepository } from './memory.repository';
+import { SQLiteBatchRepository } from './sqlite-batch.repository';
 import { ConversationData } from '../../models/conversation.model';
 import { IBatchRepository } from './base.repository';
-import path from 'path';
-import dbConfig, { DatabaseType } from '../../config/database.config';
+import logger from '../../utils/logger';
 
 /**
  * Repositorio para gestión de conversaciones
@@ -13,15 +11,9 @@ export class ConversationRepository implements IBatchRepository<ConversationData
   private repository: IBatchRepository<ConversationData>;
 
   constructor() {
-    switch (dbConfig.type) {
-      case DatabaseType.MEMORY:
-      default:
-        this.repository = new MemoryRepository<any>(
-          'conversations',
-          path.join(__dirname, '../../../data/conversations.json')
-        );
-        break;
-    }
+    // Inicializar el repositorio SQLite con operaciones batch y campo ID personalizado
+    this.repository = new SQLiteBatchRepository<ConversationData>('conversations', 'conversationId');
+    logger.debug('ConversationRepository inicializado con SQLite');
   }
 
   async create(data: ConversationData): Promise<ConversationData> {

@@ -1,9 +1,8 @@
 // src/database/repositories/agent.repository.ts
-import { MemoryRepository } from './memory.repository';
+import { SQLiteRepository } from './sqlite.repository';
 import { Agent } from '../../models/agent.model';
 import { IRepository } from './base.repository';
-import path from 'path';
-import dbConfig, { DatabaseType } from '../../config/database.config';
+import logger from '../../utils/logger';
 
 /**
  * Repositorio para gestión de agentes
@@ -12,19 +11,9 @@ export class AgentRepository implements IRepository<Agent> {
   private repository: IRepository<Agent>;
 
   constructor() {
-    // Según el tipo de base de datos, inicializar el repositorio correspondiente
-    switch (dbConfig.type) {
-      case DatabaseType.MEMORY:
-      default:
-        // Usar repositorio en memoria con persistencia a archivo
-        this.repository = new MemoryRepository<Agent>(
-          'agents',
-          path.join(__dirname, '../../../data/agents.json')
-        );
-        break;
-
-      // Aquí se pueden añadir implementaciones para otros tipos de base de datos
-    }
+    // Inicializar el repositorio SQLite con campo ID personalizado
+    this.repository = new SQLiteRepository<Agent>('agents', 'id');
+    logger.debug('AgentRepository inicializado con SQLite');
   }
 
   async create(data: Agent): Promise<Agent> {
@@ -73,7 +62,7 @@ export class AgentRepository implements IRepository<Agent> {
    * Obtener agentes disponibles (online y no ocupados)
    */
   async findAvailableAgents(): Promise<Agent[]> {
-    // En una implementación real con SQL, esto sería una consulta más compleja
+    // Obtener todos los agentes y filtrar en memoria
     const agents = await this.repository.findAll();
     return agents.filter(agent => 
       agent.status === 'online' && 

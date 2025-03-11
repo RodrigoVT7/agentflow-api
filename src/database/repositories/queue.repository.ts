@@ -1,9 +1,8 @@
 // src/database/repositories/queue.repository.ts
-import { MemoryRepository } from './memory.repository';
+import { SQLiteBatchRepository } from './sqlite-batch.repository';
 import { QueueItem } from '../../models/queue.model';
 import { IBatchRepository } from './base.repository';
-import path from 'path';
-import dbConfig, { DatabaseType } from '../../config/database.config';
+import logger from '../../utils/logger';
 
 /**
  * Repositorio para gestión de cola de espera
@@ -12,15 +11,9 @@ export class QueueRepository implements IBatchRepository<QueueItem> {
   private repository: IBatchRepository<QueueItem>;
 
   constructor() {
-    switch (dbConfig.type) {
-      case DatabaseType.MEMORY:
-      default:
-        this.repository = new MemoryRepository<any>(
-          'queue',
-          path.join(__dirname, '../../../data/queue.json')
-        );
-        break;
-    }
+    // Inicializar el repositorio SQLite con operaciones batch y campo ID personalizado
+    this.repository = new SQLiteBatchRepository<QueueItem>('queue', 'conversationId');
+    logger.debug('QueueRepository inicializado con SQLite');
   }
 
   async create(data: QueueItem): Promise<QueueItem> {
