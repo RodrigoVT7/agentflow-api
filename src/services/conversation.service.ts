@@ -222,7 +222,21 @@ class ConversationService {
 
     wsConnection.on('message', async (data: WebSocket.Data) => {
       try {
-        const message = JSON.parse(data.toString());
+        
+    const dataStr = data.toString();
+    if (!dataStr || dataStr.trim() === '') {
+      console.log('Mensaje WebSocket vacío recibido, ignorando');
+      return;
+    }
+    
+    // Intentar parsear el JSON con manejo de errores
+    let message;
+    try {
+      message = JSON.parse(dataStr);
+    } catch (parseError) {
+      console.error('Error al parsear mensaje WebSocket:', dataStr);
+      return;
+    }
         
         if (message.activities && message.activities.length > 0) {
           // Buscar respuesta del bot
