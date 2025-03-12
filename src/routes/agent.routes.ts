@@ -18,4 +18,7 @@ router.post('/tags', authMiddleware, agentController.updateTags);
 router.post('/status', authMiddleware, agentController.updateAgentStatus);
 router.get('/list', authMiddleware, agentController.getAgents);
 
+// Nueva ruta para obtener conversaciones completadas
+router.get('/completed', authMiddleware, agentController.getCompletedConversations);
+
 export default router;

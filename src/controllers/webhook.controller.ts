@@ -53,60 +53,65 @@ export class WebhookController {
       // Procesar por tipo de mensaje
       const messageObject = req.body.entry[0].changes[0].value.messages[0];
       
-      if (messageObject.type === 'text' && messageObject.text && messageObject.text.body) {
-        // Mensaje de texto
-        const msg_body = messageObject.text.body;
-        
-        console.log(`Mensaje de texto recibido de ${from}: ${msg_body}`);
-        
-        // Procesar el mensaje con el servicio de conversación
-        await conversationService.sendMessage(from, phone_number_id, msg_body);
-      } 
-      else if (messageObject.type === 'image') {
-        // Mensaje de imagen
-        console.log(`Imagen recibida de ${from}`);
-        
-        // Mensaje predeterminado para imágenes
-        await conversationService.sendMessage(
-          from, 
-          phone_number_id, 
-          "He recibido tu imagen, pero actualmente solo puedo procesar mensajes de texto."
-        );
-      }
-      else if (messageObject.type === 'audio') {
-        // Mensaje de audio
-        console.log(`Audio recibido de ${from}`);
-        
-        // Mensaje predeterminado para audio
-        await conversationService.sendMessage(
-          from, 
-          phone_number_id, 
-          "He recibido tu mensaje de voz, pero actualmente solo puedo procesar mensajes de texto."
-        );
-      }
-      else if (messageObject.type === 'document') {
-        // Documento
-        console.log(`Documento recibido de ${from}`);
-        
-        // Mensaje predeterminado para documentos
-        await conversationService.sendMessage(
-          from, 
-          phone_number_id, 
-          "He recibido tu documento, pero actualmente solo puedo procesar mensajes de texto."
-        );
-      }
-      else {
-        // Otro tipo de mensaje no soportado
-        console.log(`Mensaje no soportado recibido de ${from} (tipo: ${messageObject.type})`);
-        
-        await conversationService.sendMessage(
-          from, 
-          phone_number_id, 
-          "Lo siento, este tipo de mensaje no es compatible actualmente."
-        );
+      try {
+        if (messageObject.type === 'text' && messageObject.text && messageObject.text.body) {
+          // Mensaje de texto
+          const msg_body = messageObject.text.body;
+          
+          console.log(`Mensaje de texto recibido de ${from}: ${msg_body}`);
+          
+          // Procesar el mensaje con el servicio de conversación
+          await conversationService.sendMessage(from, phone_number_id, msg_body);
+        } 
+        else if (messageObject.type === 'image') {
+          // Mensaje de imagen
+          console.log(`Imagen recibida de ${from}`);
+          
+          // Mensaje predeterminado para imágenes
+          await conversationService.sendMessage(
+            from, 
+            phone_number_id, 
+            "He recibido tu imagen, pero actualmente solo puedo procesar mensajes de texto."
+          );
+        }
+        else if (messageObject.type === 'audio') {
+          // Mensaje de audio
+          console.log(`Audio recibido de ${from}`);
+          
+          // Mensaje predeterminado para audio
+          await conversationService.sendMessage(
+            from, 
+            phone_number_id, 
+            "He recibido tu mensaje de voz, pero actualmente solo puedo procesar mensajes de texto."
+          );
+        }
+        else if (messageObject.type === 'document') {
+          // Documento
+          console.log(`Documento recibido de ${from}`);
+          
+          // Mensaje predeterminado para documentos
+          await conversationService.sendMessage(
+            from, 
+            phone_number_id, 
+            "He recibido tu documento, pero actualmente solo puedo procesar mensajes de texto."
+          );
+        }
+        else {
+          // Otro tipo de mensaje no soportado
+          console.log(`Mensaje no soportado recibido de ${from} (tipo: ${messageObject.type})`);
+          
+          await conversationService.sendMessage(
+            from, 
+            phone_number_id, 
+            "Lo siento, este tipo de mensaje no es compatible actualmente."
+          );
+        }
+      } catch (processingError) {
+        // Registrar el error pero seguir respondiendo 200 a Meta/WhatsApp
+        console.error('Error al procesar mensaje:', processingError);
       }
       
-      // Responder correctamente a Meta
+      // Siempre enviar 200 a WhatsApp para prevenir reenvíos
       res.sendStatus(200);
     } catch (error) {
       console.error('Error al procesar webhook:', error);

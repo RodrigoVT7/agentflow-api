@@ -238,13 +238,16 @@ class QueueService {
       logger.warn(`Intento de añadir mensaje a conversación inexistente: ${conversationId}`);
       return null;
     }
-    
+
+    // Crear un nuevo ID para el mensaje si no se proporciona
+  const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
     const newMessage: Message = {
-      id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      conversationId,
-      ...message,
-      timestamp: Date.now()
-    };
+    id: messageId,
+    conversationId,
+    ...message,
+    timestamp: Date.now()
+  };
     
     // Añadir a memoria
     queueItem.messages.push(newMessage);

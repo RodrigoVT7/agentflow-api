@@ -7,6 +7,8 @@ import { Agent, AgentStatus } from '../models/agent.model';
 import { MessageSender } from '../models/message.model';
 import { initAgentService } from '../services/agent.service';
 import logger from '../utils/logger';
+import { initDatabaseConnection } from '../database/connection';
+import { ConversationStatus } from '../models/conversation.model';
 
 // Servicios
 const queueService = initQueueService();
@@ -463,6 +465,66 @@ export class AgentController {
       }
     }
   };
+
+/**
+ * Obtener conversaciones completadas
+ */
+public getCompletedConversations = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const db = await initDatabaseConnection();
+    
+    // Obtener conversaciones con status COMPLETED
+    const completedConversations = await db.all(
+      'SELECT * FROM conversations WHERE status = ? ORDER BY lastActivity DESC LIMIT 50',
+      [ConversationStatus.COMPLETED]
+    );
+    
+    // Para cada conversación, obtener sus mensajes asociados
+    const result = [];
+    for (const conv of completedConversations) {
+      const messages = await db.all(
+        'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
+        [conv.conversationId]
+      );
+      
+      // Convertir a formato esperado por el cliente
+      const queueItem = {
+        conversationId: conv.conversationId,
+        from: conv.from_number,
+        phone_number_id: conv.phone_number_id,
+        startTime: conv.lastActivity - (24 * 60 * 60 * 1000), // Estimación aproximada
+        messages: messages.map((msg: any) => ({
+          id: msg.id,
+          conversationId: msg.conversationId,
+          from: msg.from_type,
+          text: msg.text,
+          timestamp: msg.timestamp,
+          agentId: msg.agentId || undefined,
+          attachmentUrl: msg.attachmentUrl || undefined,
+          metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
+        })),
+        priority: 0,
+        tags: [],
+        assignedAgent: null,
+        metadata: {
+          isCompleted: true,
+          completedAt: conv.lastActivity, // Aquí usamos lastActivity como fecha de completado
+          completedTimestamp: conv.lastActivity // Campo alternativo por si se necesita
+        }
+      };
+      
+      result.push(queueItem);
+    }
+    
+    res.json(result);
+  } catch (error) {
+    logger.error('Error en getCompletedConversations', { error });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Error al obtener conversaciones completadas' });
+    }
+  }
+};
+  
 }
 
 export default new AgentController();

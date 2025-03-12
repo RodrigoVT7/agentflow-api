@@ -392,6 +392,20 @@ class ConversationService {
     // Guardar mensaje de sistema en la base de datos
     await this.saveMessage(from, 'system', escalationMsg);
     
+    // IMPORTANTE: Obtener todo el historial de mensajes de la conversación
+    let messageHistory: any[] = [];
+    try {
+      const db = await initDatabaseConnection();
+      messageHistory = await db.all(
+        'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
+        [from]
+      );
+      
+      console.log(`Recuperados ${messageHistory.length} mensajes históricos para la conversación ${from}`);
+    } catch (dbError) {
+      console.error('Error al recuperar historial de mensajes:', dbError);
+    }
+
     // Añadir a la cola de agentes
     this.queueService.addToQueue({
       conversationId: from,
@@ -399,20 +413,35 @@ class ConversationService {
       phone_number_id,
       assignedAgent: null,
       metadata: {
-        escalationReason: botMessage
+        escalationReason: botMessage,
+        customFields: {
+          hasFullHistory: true   // Usar customFields para propiedades personalizadas
+        }
       }
     });
     
-    // Añadir el mensaje del bot a la conversación en cola
-    this.queueService.addMessage(from, {
+    // Añadir todos los mensajes históricos a la conversación en cola
+  if (messageHistory.length > 0) {
+    for (const msg of messageHistory) {
+        // Crear un nuevo objeto de mensaje sin ID para evitar errores de tipo
+        await this.queueService.addMessage(from, {
+          from: msg.from_type as MessageSender,
+          text: msg.text,
+          agentId: msg.agentId || undefined
+        });
+    }
+  }
+  
+  // Añadir el mensaje de escalación del bot si no está ya en el historial
+  if (!messageHistory.some(m => m.text === botMessage && m.from_type === 'bot')) {
+    await this.queueService.addMessage(from, {
       from: MessageSender.BOT,
       text: botMessage
     });
-    
-    // Guardar mensaje del bot en la base de datos
-    await this.saveMessage(from, 'bot', botMessage);
-    
-    logger.info(`Conversación escalada a agente: ${from}`);
+  }
+  
+  logger.info(`Conversación escalada a agente: ${from} con ${messageHistory.length} mensajes históricos`);
+
   }
 
   /**
@@ -469,7 +498,7 @@ class ConversationService {
     
     // Actualizar estado
     conversation.isEscalated = false;
-    conversation.status = ConversationStatus.BOT;
+    conversation.status = ConversationStatus.COMPLETED;
     conversation.lastActivity = Date.now();
     
     // Actualizar en base de datos

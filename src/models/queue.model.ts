@@ -9,10 +9,12 @@ export interface QueueItem {
     tags: string[];
     assignedAgent: string | null;
     messages: Message[];
-    metadata: {
+    metadata?: {
       escalationReason?: string;
       userLocation?: string;
       previousInteractions?: number;
       customFields?: Record<string, any>;
+      hasFullHistory?: boolean;  // Añadir esta propiedad
+      originalMessage?: string;  // También útil para diagnóstico
     };
   }
