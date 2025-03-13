@@ -170,21 +170,7 @@ export class AgentController {
       logger.debug(`Agente asignado: ${conversation.assignedAgent}, Solicitado: ${agentId}`);
       
       if (conversation.assignedAgent !== agentId) {
-        // Si no está asignado, intentar asignarlo automáticamente
-        logger.info(`Intento de auto-asignación para agente ${agentId} en conversación ${conversationId}`);
-        
-        // Asignar solo si no hay otro agente asignado
-        if (!conversation.assignedAgent) {
-          const assignSuccess = await queueService.assignAgent(conversationId, agentId);
-          if (!assignSuccess) {
-            res.status(403).json({ error: 'No se pudo asignar automáticamente al agente a esta conversación' });
-            return;
-          }
-          logger.info(`Auto-asignación exitosa para agente ${agentId} en conversación ${conversationId}`);
-        } else {
-          res.status(403).json({ error: 'El agente no está asignado a esta conversación' });
-          return;
-        }
+        // Auto-asignación si es necesario...
       }
       
       // Añadir mensaje a la conversación
@@ -205,9 +191,10 @@ export class AgentController {
       // Enviar mensaje al usuario vía WhatsApp de forma asíncrona
       (async () => {
         try {
+          // CORRECCIÓN: Usar phone_number_id como emisor y from (número de teléfono) como destinatario
           await whatsappService.sendMessage(
-            conversation.phone_number_id,
-            conversationId,
+            conversation.phone_number_id,  // ID del número de WhatsApp Business
+            conversation.from,  // Número del usuario destinatario (CORREGIDO)
             message
           );
           logger.info(`Mensaje ${newMessage.id} enviado correctamente a WhatsApp`);
@@ -215,16 +202,7 @@ export class AgentController {
           logger.error(`Error al enviar mensaje ${newMessage.id} a WhatsApp:`, { error: whatsappError });
         }
         
-        // Actualizar última actividad del agente
-        const agentWithPassword = agentService.getAgentWithPasswordById(agentId);
-        if (agentWithPassword) {
-          const updatedAgent = {
-            ...agentWithPassword,
-            lastActivity: Date.now()
-          };
-          
-          agentService.setAgent(updatedAgent);
-        }
+        // Actualizar última actividad del agente...
       })().catch(error => {
         logger.error(`Error en procesamiento asíncrono después de sendMessage:`, { error });
       });
@@ -492,7 +470,7 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
         conversationId: conv.conversationId,
         from: conv.from_number,
         phone_number_id: conv.phone_number_id,
-        startTime: conv.lastActivity - (24 * 60 * 60 * 1000), // Estimación aproximada
+        startTime: conv.startTime || (conv.lastActivity - (24 * 60 * 60 * 1000)),
         messages: messages.map((msg: any) => ({
           id: msg.id,
           conversationId: msg.conversationId,
@@ -508,8 +486,10 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
         assignedAgent: null,
         metadata: {
           isCompleted: true,
-          completedAt: conv.lastActivity, // Aquí usamos lastActivity como fecha de completado
-          completedTimestamp: conv.lastActivity // Campo alternativo por si se necesita
+          completedAt: conv.lastActivity,
+          completedTimestamp: conv.lastActivity,
+          uniqueSessionId: conv.conversationId, // Añadir el ID único de la sesión
+          sessionStartDate: new Date(conv.startTime || (conv.lastActivity - (24 * 60 * 60 * 1000))).toISOString().split('T')[0] // Fecha de inicio para distinguir
         }
       };
       

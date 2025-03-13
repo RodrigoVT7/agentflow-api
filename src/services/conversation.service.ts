@@ -88,85 +88,93 @@ class ConversationService {
     }
   }
 
-  /**
-   * Obtener o crear una conversación para un usuario
-   */
-  public async getOrCreateConversation(from: string, phone_number_id: string): Promise<ConversationData> {
-    // Verificar si ya existe la conversación activa
-    let conversation = this.conversations.get(from);
+/**
+ * Obtener o crear una conversación para un usuario
+ */
+public async getOrCreateConversation(from: string, phone_number_id: string): Promise<ConversationData> {
+  // Verificar si ya existe la conversación activa
+  let conversation = this.conversations.get(from);
+  
+  // SOLUCIÓN: Verificar si la conversación está en estado COMPLETED
+  if (conversation && conversation.status === ConversationStatus.COMPLETED) {
+    logger.info(`Conversación ${conversation.conversationId} para ${from} está completada, creando una nueva`);
+    // Eliminar la conversación completada de la memoria para crear una nueva
+    this.conversations.delete(from);
+    conversation = undefined;
+  }
+  
+  // Si existe pero está inactiva por más de 24 horas, crear una nueva conversación
+  if (conversation && Date.now() - conversation.lastActivity > 24 * 60 * 60 * 1000) {
+    logger.info(`Conversación inactiva para ${from}, creando una nueva`);
     
-    // Si existe pero está inactiva por más de 24 horas, crear una nueva conversación
-    if (conversation && Date.now() - conversation.lastActivity > 24 * 60 * 60 * 1000) {
-      logger.info(`Conversación inactiva para ${from}, creando una nueva`);
-      
-      // Marcar la conversación antigua como completada en la base de datos
-      try {
-        const db = await initDatabaseConnection();
-        await db.run(
-          `UPDATE conversations SET status = ? WHERE from_number = ? AND status != ?`,
-          [ConversationStatus.COMPLETED, from, ConversationStatus.COMPLETED]
-        );
-      } catch (error) {
-        logger.error(`Error al marcar conversación antigua como completada: ${from}`, { error });
-      }
-      
-      // Eliminar de la memoria para que se cree una nueva
-      this.conversations.delete(from);
-      conversation = undefined;
+    // Marcar la conversación antigua como completada en la base de datos
+    try {
+      const db = await initDatabaseConnection();
+      await db.run(
+        `UPDATE conversations SET status = ? WHERE from_number = ? AND status != ?`,
+        [ConversationStatus.COMPLETED, from, ConversationStatus.COMPLETED]
+      );
+    } catch (error) {
+      logger.error(`Error al marcar conversación antigua como completada: ${from}`, { error });
     }
     
-    if (!conversation) {
-      // Crear una nueva conversación con DirectLine
-      const directLineConversation = await this.createDirectLineConversation();
-      
-      // Configurar WebSocket para recibir respuestas del bot
-      const wsConnection = await this.setupWebSocketConnection(
-        directLineConversation.conversationId,
-        directLineConversation.token,
-        phone_number_id,
-        from
+    // Eliminar de la memoria para que se cree una nueva
+    this.conversations.delete(from);
+    conversation = undefined;
+  }
+  
+  if (!conversation) {
+    // Crear una nueva conversación con DirectLine
+    const directLineConversation = await this.createDirectLineConversation();
+    
+    // Configurar WebSocket para recibir respuestas del bot
+    const wsConnection = await this.setupWebSocketConnection(
+      directLineConversation.conversationId,
+      directLineConversation.token,
+      phone_number_id,
+      from
+    );
+    
+    // Crear nueva conversación
+    conversation = {
+      conversationId: directLineConversation.conversationId,
+      token: directLineConversation.token,
+      wsConnection,
+      phone_number_id,
+      from,
+      isEscalated: false,
+      lastActivity: Date.now(),
+      status: ConversationStatus.BOT
+    };
+    
+    this.conversations.set(from, conversation);
+    
+    // Persistir en la base de datos
+    try {
+      const db = await initDatabaseConnection();
+      await db.run(
+        `INSERT INTO conversations 
+         (conversationId, token, phone_number_id, from_number, isEscalated, lastActivity, status) 
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          conversation.conversationId,
+          conversation.token,
+          conversation.phone_number_id,
+          conversation.from,
+          conversation.isEscalated ? 1 : 0,
+          conversation.lastActivity,
+          conversation.status
+        ]
       );
       
-      // Crear nueva conversación
-      conversation = {
-        conversationId: directLineConversation.conversationId,
-        token: directLineConversation.token,
-        wsConnection,
-        phone_number_id,
-        from,
-        isEscalated: false,
-        lastActivity: Date.now(),
-        status: ConversationStatus.BOT
-      };
-      
-      this.conversations.set(from, conversation);
-      
-      // Persistir en la base de datos
-      try {
-        const db = await initDatabaseConnection();
-        await db.run(
-          `INSERT INTO conversations 
-           (conversationId, token, phone_number_id, from_number, isEscalated, lastActivity, status) 
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [
-            conversation.conversationId,
-            conversation.token,
-            conversation.phone_number_id,
-            conversation.from,
-            conversation.isEscalated ? 1 : 0,
-            conversation.lastActivity,
-            conversation.status
-          ]
-        );
-        
-        logger.info(`Nueva conversación creada y persistida para ${from}`);
-      } catch (error) {
-        logger.error(`Error al persistir nueva conversación: ${from}`, { error });
-      }
+      logger.info(`Nueva conversación creada y persistida para ${from}`);
+    } catch (error) {
+      logger.error(`Error al persistir nueva conversación: ${from}`, { error });
     }
-    
-    return conversation;
   }
+  
+  return conversation;
+}
 
   /**
    * Crear una nueva conversación DirectLine
@@ -219,25 +227,24 @@ class ConversationService {
         }
       }
     );
-
+  
     wsConnection.on('message', async (data: WebSocket.Data) => {
       try {
+        const dataStr = data.toString();
+        if (!dataStr || dataStr.trim() === '') {
+          console.log('Mensaje WebSocket vacío recibido, ignorando');
+          return;
+        }
         
-    const dataStr = data.toString();
-    if (!dataStr || dataStr.trim() === '') {
-      console.log('Mensaje WebSocket vacío recibido, ignorando');
-      return;
-    }
-    
-    // Intentar parsear el JSON con manejo de errores
-    let message;
-    try {
-      message = JSON.parse(dataStr);
-    } catch (parseError) {
-      console.error('Error al parsear mensaje WebSocket:', dataStr);
-      return;
-    }
-        
+        // Intentar parsear el JSON con manejo de errores
+        let message;
+        try {
+          message = JSON.parse(dataStr);
+        } catch (parseError) {
+          console.error('Error al parsear mensaje WebSocket:', dataStr);
+          return;
+        }
+          
         if (message.activities && message.activities.length > 0) {
           // Buscar respuesta del bot
           const botResponse = message.activities.find((a: DirectLineActivity) => 
@@ -252,14 +259,21 @@ class ConversationService {
               await this.handleEscalation(from, phone_number_id, botResponse.text);
             } else if (!this.isEscalated(from)) {
               // Enviar respuesta normal si no está escalado
+              // CORRECCIÓN: Usar phone_number_id como emisor y from como destinatario
               await this.whatsappService.sendMessage(
-                phone_number_id,
-                from,
+                phone_number_id,  // ID del número de WhatsApp Business
+                from,  // Número del usuario destinatario
                 botResponse.text
               );
               
               // Guardar el mensaje del bot en la base de datos
-              this.saveMessage(from, 'bot', botResponse.text);
+              // Obtener conversation para usar su ID del sistema
+              const conversation = this.conversations.get(from);
+              if (conversation) {
+                await this.saveMessage(conversation.conversationId, 'bot', botResponse.text);
+              } else {
+                logger.error(`No se encontró conversación para ${from} al guardar mensaje del bot`);
+              }
             }
             
             // Actualizar timestamp de actividad
@@ -270,14 +284,13 @@ class ConversationService {
         console.error('Error al procesar mensaje WebSocket:', error);
       }
     });
-
+  
     wsConnection.on('error', (error) => {
       console.error(`Error en WebSocket para conversación ${conversationId}:`, error);
     });
-
+  
     return wsConnection;
   }
-
   /**
    * Guardar mensaje en la base de datos
    */
@@ -287,13 +300,15 @@ class ConversationService {
       const timestamp = Date.now();
       
       const db = await initDatabaseConnection();
+      
+      // Usar siempre el conversationId del sistema para guardar en la base de datos
       await db.run(
         `INSERT INTO messages (id, conversationId, from_type, text, timestamp, agentId)
          VALUES (?, ?, ?, ?, ?, ?)`,
         [messageId, conversationId, from, text, timestamp, agentId || null]
       );
       
-      logger.debug(`Mensaje guardado en base de datos: ${messageId}`);
+      logger.debug(`Mensaje guardado en base de datos: ${messageId} para conversationId=${conversationId}`);
     } catch (error) {
       logger.error(`Error al guardar mensaje en base de datos: ${conversationId}`, { error });
     }
@@ -309,7 +324,7 @@ class ConversationService {
     // Actualizar en memoria
     conversation.lastActivity = Date.now();
     
-    // Actualizar en base de datos
+    // Actualizar en base de datos usando ID del sistema
     try {
       const db = await initDatabaseConnection();
       await db.run(
@@ -320,21 +335,27 @@ class ConversationService {
       logger.error(`Error al actualizar timestamp de actividad: ${from}`, { error });
     }
   }
-
   /**
    * Enviar mensaje a la conversación
    */
   public async sendMessage(from: string, phone_number_id: string, message: string): Promise<void> {
     // Verificar si la conversación está escalada
     if (this.isEscalated(from)) {
-      // Si está escalada, guardar el mensaje en la cola para el agente
-      this.queueService.addMessage(from, {
+      // Obtener conversación para su ID del sistema
+      const conversation = this.conversations.get(from);
+      if (!conversation) {
+        logger.error(`No se encontró conversación para ${from} al enviar mensaje`);
+        return;
+      }
+      
+      // Si está escalada, guardar el mensaje en la cola para el agente usando ID del sistema
+      this.queueService.addMessage(conversation.conversationId, {
         from: MessageSender.USER,
         text: message
       });
       
-      // Guardar mensaje en la base de datos
-      await this.saveMessage(from, 'user', message);
+      // Guardar mensaje en la base de datos usando ID del sistema
+      await this.saveMessage(conversation.conversationId, 'user', message);
       
       return;
     }
@@ -346,8 +367,8 @@ class ConversationService {
     conversation.lastActivity = Date.now();
     this.updateConversationActivity(from);
     
-    // Guardar mensaje en la base de datos
-    await this.saveMessage(from, 'user', message);
+    // Guardar mensaje en la base de datos usando ID del sistema
+    await this.saveMessage(conversation.conversationId, 'user', message);
     
     // Enviar mensaje al bot
     const response = await fetch(`${config.directline.url}/conversations/${conversation.conversationId}/activities`, {
@@ -385,12 +406,25 @@ class ConversationService {
     // Actualizar estado de la conversación
     this.updateConversationStatus(from, true);
     
+    // Obtener la conversación para usar su ID del sistema
+    const conversation = this.conversations.get(from);
+    if (!conversation) {
+      logger.error(`No se encontró conversación para ${from} al intentar escalar`);
+      return;
+    }
+    
     // Enviar mensaje de confirmación al usuario
     const escalationMsg = "Tu conversación ha sido transferida a un agente. Pronto te atenderán.";
-    await this.whatsappService.sendMessage(phone_number_id, from, escalationMsg);
     
-    // Guardar mensaje de sistema en la base de datos
-    await this.saveMessage(from, 'system', escalationMsg);
+    // CORRECCIÓN: Usar phone_number_id como emisor y from como destinatario
+    await this.whatsappService.sendMessage(
+      phone_number_id,  // ID del número de WhatsApp Business
+      from,  // Número del usuario destinatario
+      escalationMsg
+    );
+    
+    // Guardar mensaje de sistema en la base de datos con ID del sistema
+    await this.saveMessage(conversation.conversationId, 'system', escalationMsg);
     
     // IMPORTANTE: Obtener todo el historial de mensajes de la conversación
     let messageHistory: any[] = [];
@@ -398,50 +432,49 @@ class ConversationService {
       const db = await initDatabaseConnection();
       messageHistory = await db.all(
         'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
-        [from]
+        [conversation.conversationId]  // Usar el ID del sistema
       );
       
-      console.log(`Recuperados ${messageHistory.length} mensajes históricos para la conversación ${from}`);
+      console.log(`Recuperados ${messageHistory.length} mensajes históricos para la conversación ${conversation.conversationId}`);
     } catch (dbError) {
       console.error('Error al recuperar historial de mensajes:', dbError);
     }
-
+  
     // Añadir a la cola de agentes
     this.queueService.addToQueue({
-      conversationId: from,
-      from,
-      phone_number_id,
+      conversationId: conversation.conversationId,  // ID del sistema para la cola
+      from,  // Mantener número de teléfono para comunicación con WhatsApp
+      phone_number_id,  // ID del número de WhatsApp Business
       assignedAgent: null,
       metadata: {
         escalationReason: botMessage,
         customFields: {
-          hasFullHistory: true   // Usar customFields para propiedades personalizadas
+          hasFullHistory: true
         }
       }
     });
     
     // Añadir todos los mensajes históricos a la conversación en cola
-  if (messageHistory.length > 0) {
-    for (const msg of messageHistory) {
+    if (messageHistory.length > 0) {
+      for (const msg of messageHistory) {
         // Crear un nuevo objeto de mensaje sin ID para evitar errores de tipo
-        await this.queueService.addMessage(from, {
+        await this.queueService.addMessage(conversation.conversationId, {  // ID del sistema
           from: msg.from_type as MessageSender,
           text: msg.text,
           agentId: msg.agentId || undefined
         });
+      }
     }
-  }
-  
-  // Añadir el mensaje de escalación del bot si no está ya en el historial
-  if (!messageHistory.some(m => m.text === botMessage && m.from_type === 'bot')) {
-    await this.queueService.addMessage(from, {
-      from: MessageSender.BOT,
-      text: botMessage
-    });
-  }
-  
-  logger.info(`Conversación escalada a agente: ${from} con ${messageHistory.length} mensajes históricos`);
-
+    
+    // Añadir el mensaje de escalación del bot si no está ya en el historial
+    if (!messageHistory.some(m => m.text === botMessage && m.from_type === 'bot')) {
+      await this.queueService.addMessage(conversation.conversationId, {  // ID del sistema
+        from: MessageSender.BOT,
+        text: botMessage
+      });
+    }
+    
+    logger.info(`Conversación escalada a agente: ${from} con ${messageHistory.length} mensajes históricos`);
   }
 
   /**
@@ -501,34 +534,35 @@ class ConversationService {
     conversation.status = ConversationStatus.COMPLETED;
     conversation.lastActivity = Date.now();
     
-    // Actualizar en base de datos
+    // Actualizar en base de datos usando ID del sistema
     try {
       const db = await initDatabaseConnection();
       await db.run(
         `UPDATE conversations 
-         SET isEscalated = 0, status = ?, lastActivity = ? 
-         WHERE conversationId = ?`,
+           SET isEscalated = 0, status = ?, lastActivity = ? 
+           WHERE conversationId = ?`,
         [conversation.status, conversation.lastActivity, conversation.conversationId]
       );
     } catch (error) {
       logger.error(`Error al actualizar estado de conversación completada: ${from}`, { error });
     }
     
-    // Eliminar de la cola de agentes
-    const completed = await this.queueService.completeConversation(from);
+    // Eliminar de la cola de agentes usando ID del sistema
+    const completed = await this.queueService.completeConversation(conversation.conversationId);
     
     // Enviar mensaje de finalización
     if (completed) {
       const completionMessage = "La conversación con el agente ha finalizado. ¿En qué más puedo ayudarte?";
       
+      // CORRECCIÓN: Usar phone_number_id como emisor y from como destinatario
       await this.whatsappService.sendMessage(
-        conversation.phone_number_id,
-        from,
+        conversation.phone_number_id,  // ID del número de WhatsApp Business
+        from,  // Número del usuario destinatario
         completionMessage
       );
       
-      // Guardar mensaje de sistema en la base de datos
-      await this.saveMessage(from, 'system', completionMessage);
+      // Guardar mensaje de sistema en la base de datos con ID del sistema
+      await this.saveMessage(conversation.conversationId, 'system', completionMessage);
       
       logger.info(`Conversación con agente finalizada: ${from}`);
     }

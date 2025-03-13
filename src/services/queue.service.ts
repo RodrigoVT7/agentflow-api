@@ -232,12 +232,27 @@ class QueueService {
    * Añadir un mensaje a una conversación
    */
   public async addMessage(conversationId: string, message: Omit<Message, 'id' | 'conversationId' | 'timestamp'>): Promise<Message | null> {
-    const queueItem = this.agentQueues.get(conversationId);
-    
-    if (!queueItem) {
-      logger.warn(`Intento de añadir mensaje a conversación inexistente: ${conversationId}`);
-      return null;
+    // Verificar si es un número de teléfono o un conversationId real
+  let queueItem = this.agentQueues.get(conversationId);
+  
+  // Si no encontramos la conversación, verificar si conversationId es un número de teléfono
+  if (!queueItem) {
+    // Buscar conversación por número en nuestras conversaciones
+    for (const item of this.agentQueues.values()) {
+      if (item.from === conversationId) {
+        queueItem = item;
+        logger.warn(`Intento de usar número (${conversationId}) como conversationId, usando ID correcto: ${queueItem.conversationId}`);
+        // Usar el conversationId correcto
+        conversationId = queueItem.conversationId;
+        break;
+      }
     }
+  }
+  
+  if (!queueItem) {
+    logger.warn(`Intento de añadir mensaje a conversación inexistente: ${conversationId}`);
+    return null;
+  }
 
     // Crear un nuevo ID para el mensaje si no se proporciona
   const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
