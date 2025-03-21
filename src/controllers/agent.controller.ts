@@ -136,84 +136,88 @@ export class AgentController {
     }
   };
 
-  /**
-   * Enviar mensaje desde un agente
-   */
-  public sendMessage = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const { agentId, conversationId, message } = req.body;
-      
-      if (!agentId || !conversationId || !message) {
-        res.status(400).json({ error: 'Se requieren agentId, conversationId y message' });
-        return;
-      }
-      
-      logger.debug(`Enviando mensaje: Agente ${agentId}, Conversación ${conversationId}`);
-      
-      // Verificar que el agente existe
-      const agent = agentService.getAgentById(agentId);
-      if (!agent) {
-        res.status(404).json({ error: 'Agente no encontrado' });
-        return;
-      }
-      
-      // Verificar que la conversación existe
-      const conversation = queueService.getConversation(conversationId);
-      logger.debug(`Conversación encontrada:`, { conversation: JSON.stringify(conversation) });
-      
-      if (!conversation) {
-        res.status(404).json({ error: 'Conversación no encontrada' });
-        return;
-      }
-      
-      // Verificar que el agente está asignado a esta conversación
-      logger.debug(`Agente asignado: ${conversation.assignedAgent}, Solicitado: ${agentId}`);
-      
-      if (conversation.assignedAgent !== agentId) {
-        // Auto-asignación si es necesario...
-      }
-      
-      // Añadir mensaje a la conversación
-      const newMessage = await queueService.addMessage(conversationId, {
-        from: 'agent' as MessageSender,
-        text: message,
-        agentId
-      });
-      
-      if (!newMessage) {
-        res.status(500).json({ error: 'No se pudo añadir el mensaje' });
-        return;
-      }
-      
-      // Responder inmediatamente para evitar timeout
-      res.json({ success: true, messageId: newMessage.id });
-      
-      // Enviar mensaje al usuario vía WhatsApp de forma asíncrona
-      (async () => {
-        try {
-          // CORRECCIÓN: Usar phone_number_id como emisor y from (número de teléfono) como destinatario
-          await whatsappService.sendMessage(
-            conversation.phone_number_id,  // ID del número de WhatsApp Business
-            conversation.from,  // Número del usuario destinatario (CORREGIDO)
-            message
-          );
-          logger.info(`Mensaje ${newMessage.id} enviado correctamente a WhatsApp`);
-        } catch (whatsappError) {
-          logger.error(`Error al enviar mensaje ${newMessage.id} a WhatsApp:`, { error: whatsappError });
-        }
-        
-        // Actualizar última actividad del agente...
-      })().catch(error => {
-        logger.error(`Error en procesamiento asíncrono después de sendMessage:`, { error });
-      });
-      
-    } catch (error) {
-      logger.error("Error en sendMessage:", { error, body: req.body });
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Error al enviar el mensaje' });
-      }
+/**
+ * Enviar mensaje desde un agente
+ */
+public sendMessage = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { agentId, conversationId, message } = req.body;
+    
+    if (!agentId || !conversationId || !message) {
+      res.status(400).json({ error: 'Se requieren agentId, conversationId y message' });
+      return;
     }
-  };
+    
+    logger.debug(`Enviando mensaje: Agente ${agentId}, Conversación ${conversationId}`);
+    
+    // Verificar que el agente existe
+    const agent = agentService.getAgentById(agentId);
+    if (!agent) {
+      res.status(404).json({ error: 'Agente no encontrado' });
+      return;
+    }
+    
+    // Verificar que la conversación existe
+    const conversation = queueService.getConversation(conversationId);
+    logger.debug(`Conversación encontrada:`, { conversation: JSON.stringify(conversation) });
+    
+    if (!conversation) {
+      res.status(404).json({ error: 'Conversación no encontrada' });
+      return;
+    }
+    
+    // Verificar que el agente está asignado a esta conversación
+    logger.debug(`Agente asignado: ${conversation.assignedAgent}, Solicitado: ${agentId}`);
+    
+    if (conversation.assignedAgent !== agentId) {
+      // Rechazar el envío de mensajes si el agente no está asignado
+      res.status(403).json({ 
+        error: 'No estás asignado a esta conversación. Debes asignarte primero.'
+      });
+      return;
+    }
+    
+    // Añadir mensaje a la conversación
+    const newMessage = await queueService.addMessage(conversationId, {
+      from: 'agent' as MessageSender,
+      text: message,
+      agentId
+    });
+    
+    if (!newMessage) {
+      res.status(500).json({ error: 'No se pudo añadir el mensaje' });
+      return;
+    }
+    
+    // Responder inmediatamente para evitar timeout
+    res.json({ success: true, messageId: newMessage.id });
+    
+    // Enviar mensaje al usuario vía WhatsApp de forma asíncrona
+    (async () => {
+      try {
+        // CORRECCIÓN: Usar phone_number_id como emisor y from (número de teléfono) como destinatario
+        await whatsappService.sendMessage(
+          conversation.phone_number_id,  // ID del número de WhatsApp Business
+          conversation.from,  // Número del usuario destinatario (CORREGIDO)
+          message
+        );
+        logger.info(`Mensaje ${newMessage.id} enviado correctamente a WhatsApp`);
+      } catch (whatsappError) {
+        logger.error(`Error al enviar mensaje ${newMessage.id} a WhatsApp:`, { error: whatsappError });
+      }
+      
+      // Actualizar última actividad del agente...
+    })().catch(error => {
+      logger.error(`Error en procesamiento asíncrono después de sendMessage:`, { error });
+    });
+    
+  } catch (error) {
+    logger.error("Error en sendMessage:", { error, body: req.body });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Error al enviar el mensaje' });
+    }
+  }
+};
 
   /**
    * Finalizar conversación y devolver al bot
