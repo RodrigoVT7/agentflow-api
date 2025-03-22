@@ -65,7 +65,7 @@ export class AgentRepository implements IRepository<Agent> {
     // Obtener todos los agentes y filtrar en memoria
     const agents = await this.repository.findAll();
     return agents.filter(agent => 
-      agent.status === 'online' && 
+      agent.status === 'En linea' && 
       agent.activeConversations.length < agent.maxConcurrentChats
     );
   }

@@ -1,8 +1,8 @@
 export enum AgentStatus {
-    OFFLINE = 'offline',
-    ONLINE = 'online',
-    BUSY = 'busy',
-    AWAY = 'away',
+    OFFLINE = 'Desconectado',
+    ONLINE = 'En linea',
+    BUSY = 'Ocupado',
+    AWAY = 'No disponible',
   }
   
   export interface Agent {

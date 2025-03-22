@@ -9,7 +9,7 @@ import { initAgentService } from '../services/agent.service';
 import logger from '../utils/logger';
 import { initDatabaseConnection } from '../database/connection';
 import { ConversationStatus } from '../models/conversation.model';
-
+import bcrypt from 'bcrypt';
 // Servicios
 const queueService = initQueueService();
 const conversationService = initConversationService();
@@ -480,23 +480,44 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
         metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
       }));
       
+      // Extraer metadata adicional si existe
+      let metadataObj: Record<string, any> = {};
+      let originalStartTime = null;
+      let originalPriority = 2; // Default priority as fallback
+      
+      if (conv.metadata) {
+        try {
+          metadataObj = JSON.parse(conv.metadata);
+          originalStartTime = metadataObj.originalStartTime;
+          originalPriority = metadataObj.originalPriority || 2;
+        } catch (e) {
+          logger.warn(`Error parsing metadata for conversation ${conv.conversationId}`);
+        }
+      }
+      
+      // Use original start time or fallback to estimate
+      const startTime = originalStartTime || 
+                        (conv.startTime || 
+                        (conv.lastActivity - (24 * 60 * 60 * 1000)));
+      
       // Convertir a formato esperado para cliente (sin duplicar mensajes)
       const queueItem = {
         conversationId: conv.conversationId,
         from: conv.from_number,
         phone_number_id: conv.phone_number_id,
-        startTime: conv.startTime || (conv.lastActivity - (24 * 60 * 60 * 1000)),
-        // Usar directamente los mensajes formateados
+        startTime: startTime,
         messages: formattedMessages,
-        priority: 0,
+        priority: originalPriority,
         tags: [],
         assignedAgent: null,
         metadata: {
           isCompleted: true,
           completedAt: conv.lastActivity,
           completedTimestamp: conv.lastActivity,
+          originalStartTime: startTime,
+          originalPriority: originalPriority,
           uniqueSessionId: conv.conversationId,
-          sessionStartDate: new Date(conv.startTime || (conv.lastActivity - (24 * 60 * 60 * 1000))).toISOString().split('T')[0]
+          sessionStartDate: new Date(startTime).toISOString().split('T')[0]
         }
       };
       
@@ -508,6 +529,107 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
     logger.error('Error in getCompletedConversations', { error });
     if (!res.headersSent) {
       res.status(500).json({ error: 'Error getting completed conversations' });
+    }
+  }
+};
+
+
+/**
+ * Update an existing agent
+ */
+public updateAgent = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { agentId } = req.params;
+    const { name, email, password, role, maxConcurrentChats } = req.body;
+    
+    // Check if the agent exists
+    const existingAgent = agentService.getAgentWithPasswordById(agentId);
+    
+    if (!existingAgent) {
+      res.status(404).json({ error: 'Agent not found' });
+      return;
+    }
+    
+    // If role is provided, validate it
+    if (role && !['agent', 'supervisor', 'admin'].includes(role)) {
+      res.status(400).json({ error: 'Invalid role. Must be agent, supervisor or admin' });
+      return;
+    }
+    
+    // Prepare updated agent object
+    const updatedAgent: Agent & { password: string } = {
+      ...existingAgent,
+      name: name || existingAgent.name,
+      email: email || existingAgent.email,
+      role: (role as 'agent' | 'supervisor' | 'admin') || existingAgent.role,
+      maxConcurrentChats: maxConcurrentChats || existingAgent.maxConcurrentChats,
+      lastActivity: Date.now()
+    };
+    
+    // Update password if provided
+    if (password) {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      updatedAgent.password = hashedPassword;
+    }
+    
+    // Update agent
+    agentService.setAgent(updatedAgent);
+    
+    // Return agent without password
+    const { password: _, ...agentWithoutPassword } = updatedAgent;
+    
+    logger.info(`Agent ${agentId} updated successfully`);
+    res.json(agentWithoutPassword);
+  } catch (error) {
+    logger.error('Error in updateAgent', { error, agentId: req.params.agentId });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Error updating agent' });
+    }
+  }
+};
+
+/**
+ * Delete an agent
+ */
+public deleteAgent = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const { agentId } = req.params;
+    
+    // Check if the agent exists
+    const existingAgent = agentService.getAgentById(agentId);
+    
+    if (!existingAgent) {
+      res.status(404).json({ error: 'Agent not found' });
+      return;
+    }
+    
+    // Ensure an agent can't delete themselves
+    if (req.agent && req.agent.id === agentId) {
+      res.status(403).json({ error: 'You cannot delete your own account' });
+      return;
+    }
+    
+    // Check if the agent has active conversations
+    if (existingAgent.activeConversations && existingAgent.activeConversations.length > 0) {
+      res.status(409).json({ 
+        error: 'Cannot delete agent with active conversations. Reassign conversations first.' 
+      });
+      return;
+    }
+    
+    // Delete agent
+    const deleted = await agentService.deleteAgent(agentId);
+    
+    if (deleted) {
+      logger.info(`Agent ${agentId} deleted successfully`);
+      res.json({ success: true });
+    } else {
+      res.status(500).json({ error: 'Failed to delete agent' });
+    }
+  } catch (error) {
+    logger.error('Error in deleteAgent', { error, agentId: req.params.agentId });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Error deleting agent' });
     }
   }
 };

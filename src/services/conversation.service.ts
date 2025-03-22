@@ -568,8 +568,16 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
   }
   
   try {
-    // Primero eliminamos de la cola para evitar problemas de duplicación
-    const completed = await this.queueService.completeConversation(conversation.conversationId);
+    // Inicializar queueService para acceder a los métodos
+    const queueService = initQueueService();
+    
+    // Primero obtenemos información de la cola antes de eliminar
+    const queueItem = queueService.getConversation(conversation.conversationId);
+    const startTime = queueItem?.startTime || conversation.lastActivity;
+    const priority = queueItem?.priority || 1;
+    
+    // Completamos la conversación (elimina de la cola)
+    const completed = await queueService.completeConversation(conversation.conversationId);
     if (!completed) {
       logger.error(`Error al eliminar conversación ${conversationId} de la cola`);
       return false;
@@ -578,14 +586,22 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
     // Actualizar estado en la base de datos
     const db = await initDatabaseConnection();
     
+    // Guardar información adicional para el historial (startTime y priority)
+    const metadata = JSON.stringify({
+      completedAt: Date.now(),
+      originalStartTime: startTime,
+      originalPriority: priority
+    });
+    
     // Usar una transacción para garantizar consistencia
     const transaction = db.transaction(() => {
-      // Actualizar estado en la tabla de conversaciones
+      // Actualizar estado en la tabla de conversaciones 
+      // Aquí incluimos la hora de inicio original y la prioridad en metadata
       db.prepare(
         `UPDATE conversations 
-         SET isEscalated = 0, status = ?, lastActivity = ? 
+         SET isEscalated = 0, status = ?, lastActivity = ?, metadata = ? 
          WHERE conversationId = ?`
-      ).run(ConversationStatus.COMPLETED, Date.now(), conversation.conversationId);
+      ).run(ConversationStatus.COMPLETED, Date.now(), metadata, conversation.conversationId);
       
       // Asegurarse de que no queden registros en la tabla queue
       db.prepare('DELETE FROM queue WHERE conversationId = ?')
