@@ -463,26 +463,31 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
     // For each conversation, get associated messages
     const result = [];
     for (const conv of completedConversations) {
+      // Obtener mensajes para esta conversación
       const messages = db.prepare(
         'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC'
       ).all(conv.conversationId);
       
-      // Convert to expected format for client
+      // Mapear mensajes al formato esperado
+      const formattedMessages = messages.map((msg: any) => ({
+        id: msg.id,
+        conversationId: msg.conversationId,
+        from: msg.from_type,
+        text: msg.text,
+        timestamp: msg.timestamp,
+        agentId: msg.agentId || undefined,
+        attachmentUrl: msg.attachmentUrl || undefined,
+        metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
+      }));
+      
+      // Convertir a formato esperado para cliente (sin duplicar mensajes)
       const queueItem = {
         conversationId: conv.conversationId,
         from: conv.from_number,
         phone_number_id: conv.phone_number_id,
         startTime: conv.startTime || (conv.lastActivity - (24 * 60 * 60 * 1000)),
-        messages: messages.map((msg: any) => ({
-          id: msg.id,
-          conversationId: msg.conversationId,
-          from: msg.from_type,
-          text: msg.text,
-          timestamp: msg.timestamp,
-          agentId: msg.agentId || undefined,
-          attachmentUrl: msg.attachmentUrl || undefined,
-          metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
-        })),
+        // Usar directamente los mensajes formateados
+        messages: formattedMessages,
         priority: 0,
         tags: [],
         assignedAgent: null,

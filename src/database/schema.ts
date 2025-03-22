@@ -10,7 +10,7 @@ export async function initializeSchema(): Promise<void> {
     const db = await initDatabaseConnection();
     
     // Create agents table
-    await db.exec(`
+    db.exec(`
       CREATE TABLE IF NOT EXISTS agents (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,

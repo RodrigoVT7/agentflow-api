@@ -2,6 +2,7 @@
 import { IBatchRepository } from './base.repository';
 import { SQLiteRepository } from './sqlite.repository';
 import logger from '../../utils/logger';
+import { initDatabaseConnection } from '../connection';
 
 /**
  * Repositorio SQLite con operaciones batch
@@ -52,20 +53,53 @@ export class SQLiteBatchRepository<T> implements IBatchRepository<T> {
    * Crear múltiples registros
    */
   async createMany(items: T[]): Promise<T[]> {
-    // Implementar como operaciones individuales
-    const results: T[] = [];
-    
-    for (const item of items) {
-      try {
-        const created = await this.repository.create(item);
-        results.push(created);
-      } catch (error) {
-        logger.error('Error al crear múltiples elementos', { error, item });
-        throw error;
-      }
+    try {
+      const db = await initDatabaseConnection();
+      const results: T[] = [];
+      
+      // Use transaction for better performance
+      const transaction = db.transaction((itemsList: T[]) => {
+        for (const item of itemsList) {
+          const newItem = { ...item } as any;
+          
+          // Generate ID if needed
+          if (!newItem[this.idField]) {
+            const { v4: uuidv4 } = require('uuid');
+            newItem[this.idField] = uuidv4();
+          }
+          
+          // Convert object to column-value pairs
+          const columns = Object.keys(newItem);
+          const values = Object.values(newItem).map(value => {
+            if (value === null || value === undefined) {
+              return null;
+            }
+            if (typeof value === 'object') {
+              return JSON.stringify(value);
+            }
+            return value;
+          });
+          
+          // Create query
+          const placeholders = columns.map(() => '?').join(', ');
+          const query = `INSERT INTO ${this.repository['tableName']} (${columns.join(', ')}) VALUES (${placeholders})`;
+          
+          // Execute query
+          db.prepare(query).run(...values);
+          
+          // Add to results
+          results.push(newItem);
+        }
+      });
+      
+      // Execute transaction
+      transaction(items);
+      
+      return results;
+    } catch (error) {
+      logger.error('Error creating multiple items', { error });
+      throw error;
     }
-    
-    return results;
   }
 
   /**
@@ -75,20 +109,53 @@ export class SQLiteBatchRepository<T> implements IBatchRepository<T> {
     try {
       // Buscar todos los items que coincidan con el filtro
       const items = await this.repository.findAll(filter);
-      let updateCount = 0;
       
-      // Actualizar cada elemento individualmente
-      for (const item of items) {
-        const itemAny = item as any;
-        if (itemAny[this.idField]) {
-          const updated = await this.repository.update(itemAny[this.idField], data);
-          if (updated) updateCount++;
+      if (items.length === 0) {
+        return 0;
+      }
+      
+      const db = await initDatabaseConnection();
+      
+      // Preparar datos para actualización
+      const columns: string[] = [];
+      const baseValues: any[] = [];
+      
+      for (const [key, value] of Object.entries(data)) {
+        if (key === this.idField) continue; // No actualizar ID
+        
+        columns.push(`${key} = ?`);
+        
+        if (value === null || value === undefined) {
+          baseValues.push(null);
+        } else if (typeof value === 'object') {
+          baseValues.push(JSON.stringify(value));
+        } else {
+          baseValues.push(value);
         }
       }
       
-      return updateCount;
+      if (columns.length === 0) {
+        return 0;
+      }
+      
+      // Prepare update query
+      const query = `UPDATE ${this.repository['tableName']} SET ${columns.join(', ')} WHERE ${this.idField} = ?`;
+      const updateStmt = db.prepare(query);
+      
+      // Use transaction for better performance
+      const transaction = db.transaction((itemsList: any[]) => {
+        for (const item of itemsList) {
+          const values = [...baseValues, item[this.idField]];
+          updateStmt.run(...values);
+        }
+      });
+      
+      // Execute transaction
+      transaction(items);
+      
+      return items.length;
     } catch (error) {
-      logger.error('Error al actualizar múltiples elementos', { error });
+      logger.error('Error updating multiple items', { error });
       throw error;
     }
   }
@@ -100,20 +167,30 @@ export class SQLiteBatchRepository<T> implements IBatchRepository<T> {
     try {
       // Buscar todos los items que coincidan con el filtro
       const items = await this.repository.findAll(filter);
-      let deleteCount = 0;
       
-      // Eliminar cada elemento individualmente
-      for (const item of items) {
-        const itemAny = item as any;
-        if (itemAny[this.idField]) {
-          const deleted = await this.repository.delete(itemAny[this.idField]);
-          if (deleted) deleteCount++;
-        }
+      if (items.length === 0) {
+        return 0;
       }
       
-      return deleteCount;
+      const db = await initDatabaseConnection();
+      
+      // Prepare delete query
+      const query = `DELETE FROM ${this.repository['tableName']} WHERE ${this.idField} = ?`;
+      const deleteStmt = db.prepare(query);
+      
+      // Use transaction for better performance
+      const transaction = db.transaction((itemsList: any[]) => {
+        for (const item of itemsList) {
+          deleteStmt.run(item[this.idField]);
+        }
+      });
+      
+      // Execute transaction
+      transaction(items);
+      
+      return items.length;
     } catch (error) {
-      logger.error('Error al eliminar múltiples elementos', { error });
+      logger.error('Error deleting multiple items', { error });
       throw error;
     }
   }

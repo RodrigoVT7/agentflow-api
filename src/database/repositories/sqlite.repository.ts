@@ -24,42 +24,41 @@ export class SQLiteRepository<T> implements IRepository<T> {
   /**
    * Crear un nuevo registro
    */
-// Update the repository methods to use better-sqlite3 synchronous API
-async create(data: T): Promise<T> {
-  try {
-    const db = await initDatabaseConnection();
-    
-    // Generate ID if it doesn't exist
-    const newItem = { ...data } as any;
-    if (!newItem[this.idField]) {
-      newItem[this.idField] = uuidv4();
+  async create(data: T): Promise<T> {
+    try {
+      const db = await initDatabaseConnection();
+      
+      // Generate ID if it doesn't exist
+      const newItem = { ...data } as any;
+      if (!newItem[this.idField]) {
+        newItem[this.idField] = uuidv4();
+      }
+      
+      // Convert object to column-value pairs
+      const columns = Object.keys(newItem);
+      const values = Object.values(newItem).map(value => {
+        if (value === null || value === undefined) {
+          return null;
+        }
+        if (typeof value === 'object') {
+          return JSON.stringify(value);
+        }
+        return value;
+      });
+      
+      // Create query
+      const placeholders = columns.map(() => '?').join(', ');
+      const query = `INSERT INTO ${this.tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
+      
+      // Execute query - better-sqlite3 is synchronous
+      db.prepare(query).run(...values);
+      
+      return newItem;
+    } catch (error) {
+      logger.error(`Error creating in ${this.tableName}`, { error });
+      throw error;
     }
-    
-    // Convert object to column-value pairs
-    const columns = Object.keys(newItem);
-    const values = Object.values(newItem).map(value => {
-      if (value === null || value === undefined) {
-        return null;
-      }
-      if (typeof value === 'object') {
-        return JSON.stringify(value);
-      }
-      return value;
-    });
-    
-    // Create query
-    const placeholders = columns.map(() => '?').join(', ');
-    const query = `INSERT INTO ${this.tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
-    
-    // Execute query - better-sqlite3 is synchronous
-    db.prepare(query).run(...values);
-    
-    return newItem;
-  } catch (error) {
-    logger.error(`Error creating in ${this.tableName}`, { error });
-    throw error;
   }
-}
 
   /**
    * Buscar por ID
@@ -185,7 +184,7 @@ async create(data: T): Promise<T> {
       
       // Ejecutar actualización
       const query = `UPDATE ${this.tableName} SET ${columns.join(', ')} WHERE ${this.idField} = ?`;
-      await db.run(query, values);
+      db.prepare(query).run(...values);
       
       // Obtener item actualizado
       return this.findById(id);
@@ -210,7 +209,7 @@ async create(data: T): Promise<T> {
       
       // Ejecutar eliminación
       const query = `DELETE FROM ${this.tableName} WHERE ${this.idField} = ?`;
-      await db.run(query, [id]);
+      db.prepare(query).run(id);
       
       return true;
     } catch (error) {
@@ -245,7 +244,7 @@ async create(data: T): Promise<T> {
       
       // Si no hay filtros, contar directamente en la BD
       const db = await initDatabaseConnection();
-      const result = await db.get(`SELECT COUNT(*) as count FROM ${this.tableName}`);
+      const result = db.prepare(`SELECT COUNT(*) as count FROM ${this.tableName}`).get();
       return result.count;
     } catch (error) {
       logger.error(`Error al contar en ${this.tableName}`, { error });

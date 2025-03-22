@@ -53,11 +53,11 @@ export class AgentService {
       const activeConversationsStr = JSON.stringify(agent.activeConversations);
       
       // Verificar si el agente ya existe
-      const existingAgent = await db.get('SELECT id FROM agents WHERE id = ?', [agent.id]);
+      const existingAgent = db.prepare('SELECT id FROM agents WHERE id = ?').get(agent.id);
       
       if (existingAgent) {
         // Actualizar
-        await db.run(
+        db.prepare(
           `UPDATE agents SET 
             name = ?, 
             email = ?, 
@@ -67,36 +67,34 @@ export class AgentService {
             maxConcurrentChats = ?, 
             role = ?, 
             lastActivity = ?
-          WHERE id = ?`,
-          [
-            agent.name, 
-            agent.email, 
-            agent.password, 
-            agent.status, 
-            activeConversationsStr, 
-            agent.maxConcurrentChats, 
-            agent.role, 
-            agent.lastActivity, 
-            agent.id
-          ]
+          WHERE id = ?`
+        ).run(
+          agent.name, 
+          agent.email, 
+          agent.password, 
+          agent.status, 
+          activeConversationsStr, 
+          agent.maxConcurrentChats, 
+          agent.role, 
+          agent.lastActivity, 
+          agent.id
         );
       } else {
         // Insertar
-        await db.run(
+        db.prepare(
           `INSERT INTO agents
             (id, name, email, password, status, activeConversations, maxConcurrentChats, role, lastActivity)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            agent.id, 
-            agent.name, 
-            agent.email, 
-            agent.password, 
-            agent.status, 
-            activeConversationsStr, 
-            agent.maxConcurrentChats, 
-            agent.role, 
-            agent.lastActivity
-          ]
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          agent.id, 
+          agent.name, 
+          agent.email, 
+          agent.password, 
+          agent.status, 
+          activeConversationsStr, 
+          agent.maxConcurrentChats, 
+          agent.role, 
+          agent.lastActivity
         );
       }
     } catch (error) {
@@ -207,9 +205,9 @@ public async initDefaultAgents(): Promise<void> {
     // Create default agents array
     const defaultAgents = [
       {
-        id: 'agent_1',
-        name: 'Agente 1',
-        email: 'agent1@example.com',
+        id: 'agent',
+        name: 'Agente',
+        email: 'agent@metrobot.com',
         password: hashedPassword,
         status: AgentStatus.ONLINE,
         activeConversations: [],
@@ -218,31 +216,9 @@ public async initDefaultAgents(): Promise<void> {
         lastActivity: Date.now()
       },
       {
-        id: 'agent_2',
-        name: 'Agente 2',
-        email: 'agent2@example.com',
-        password: hashedPassword,
-        status: AgentStatus.ONLINE,
-        activeConversations: [],
-        maxConcurrentChats: 3,
-        role: 'agent' as 'agent' | 'supervisor' | 'admin',
-        lastActivity: Date.now()
-      },
-      {
-        id: 'agent_3',
-        name: 'Agente 3',
-        email: 'agent3@example.com',
-        password: hashedPassword,
-        status: AgentStatus.ONLINE,
-        activeConversations: [],
-        maxConcurrentChats: 3,
-        role: 'agent' as 'agent' | 'supervisor' | 'admin',
-        lastActivity: Date.now()
-      },
-      {
-        id: 'supervisor_1',
+        id: 'supervisor',
         name: 'Supervisor',
-        email: 'supervisor@example.com',
+        email: 'supervisor@metrobot.com',
         password: hashedPassword,
         status: AgentStatus.ONLINE,
         activeConversations: [],
@@ -251,9 +227,9 @@ public async initDefaultAgents(): Promise<void> {
         lastActivity: Date.now()
       },
       {
-        id: 'admin_1',
+        id: 'admin',
         name: 'Administrador',
-        email: 'admin@example.com',
+        email: 'admin@metrobot.com',
         password: adminPassword,
         status: AgentStatus.ONLINE,
         activeConversations: [],

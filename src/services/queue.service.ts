@@ -80,15 +80,36 @@ class QueueService {
     }
   }
 
-  /**
-   * Añadir una conversación a la cola de espera
-   */
-  public async addToQueue(queueItem: Omit<QueueItem, 'startTime' | 'messages' | 'priority' | 'tags'>): Promise<QueueItem> {
+/**
+ * Añadir una conversación a la cola de espera
+ */
+public async addToQueue(queueItem: Omit<QueueItem, 'startTime' | 'messages' | 'priority' | 'tags'>): Promise<QueueItem> {
+  try {
+    // Verificar si ya existe en la cola para evitar duplicados
+    const existingItem = this.agentQueues.get(queueItem.conversationId);
+    if (existingItem) {
+      logger.warn(`Conversación ${queueItem.conversationId} ya existe en la cola, actualizando metadata`);
+      
+      // Actualizar metadata si es necesario
+      if (queueItem.metadata) {
+        existingItem.metadata = {
+          ...existingItem.metadata,
+          ...queueItem.metadata
+        };
+        
+        // Actualizar en BD
+        await this.updateMetadata(queueItem.conversationId, existingItem.metadata);
+      }
+      
+      return existingItem;
+    }
+    
+    // Si no existe, crear nueva entrada
     const newQueueItem: QueueItem = {
       ...queueItem,
       startTime: Date.now(),
-      messages: [],
-      priority: 1, // Prioridad normal por defecto
+      messages: [], // Inicialmente vacío, se cargarán bajo demanda
+      priority: 1,  // Prioridad normal por defecto
       tags: [],
       metadata: queueItem.metadata || {}
     };
@@ -96,40 +117,83 @@ class QueueService {
     // Guardar en memoria
     this.agentQueues.set(queueItem.conversationId, newQueueItem);
     
-    try {
-      // Guardar en SQLite
-      const db = await initDatabaseConnection();
+    // Verificar si ya existe en base de datos
+    const db = await initDatabaseConnection();
+    const existingQueueEntry = db.prepare(
+      'SELECT conversationId FROM queue WHERE conversationId = ?'
+    ).get(queueItem.conversationId);
+    
+    if (existingQueueEntry) {
+      logger.warn(`Conversación ${queueItem.conversationId} ya existe en BD, actualizando`);
       
-      // Convertir arrays y objetos a JSON para almacenar
+      // Actualizar la entrada existente
       const tagsJson = JSON.stringify(newQueueItem.tags);
       const metadataJson = JSON.stringify(newQueueItem.metadata);
       
-      await db.run(
-        `INSERT INTO queue
-         (conversationId, from_number, phone_number_id, startTime, priority, tags, assignedAgent, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          newQueueItem.conversationId,
-          newQueueItem.from,
-          newQueueItem.phone_number_id,
-          newQueueItem.startTime,
-          newQueueItem.priority,
-          tagsJson,
-          newQueueItem.assignedAgent,
-          metadataJson
-        ]
+      db.prepare(`
+        UPDATE queue 
+        SET startTime = ?, priority = ?, tags = ?, assignedAgent = ?, metadata = ? 
+        WHERE conversationId = ?
+      `).run(
+        newQueueItem.startTime,
+        newQueueItem.priority,
+        tagsJson,
+        newQueueItem.assignedAgent,
+        metadataJson,
+        queueItem.conversationId
       );
+    } else {
+      // Insertar nueva entrada
+      const tagsJson = JSON.stringify(newQueueItem.tags);
+      const metadataJson = JSON.stringify(newQueueItem.metadata);
       
-      // Notificar a los agentes disponibles
-      this.notifyQueueUpdated();
-      
-      logger.info(`Nueva conversación añadida a la cola: ${queueItem.conversationId}`);
-    } catch (error) {
-      logger.error(`Error al guardar nueva conversación en cola: ${queueItem.conversationId}`, { error });
+      db.prepare(`
+        INSERT INTO queue
+        (conversationId, from_number, phone_number_id, startTime, priority, tags, assignedAgent, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        newQueueItem.conversationId,
+        newQueueItem.from,
+        newQueueItem.phone_number_id,
+        newQueueItem.startTime,
+        newQueueItem.priority,
+        tagsJson,
+        newQueueItem.assignedAgent,
+        metadataJson
+      );
     }
     
+    // Notificar a los agentes disponibles
+    this.notifyQueueUpdated();
+    
+    logger.info(`Conversación ${queueItem.conversationId} añadida a la cola`);
+    
+    // Cargar mensajes existentes para esta conversación
+    this.loadMessagesForQueueItem(newQueueItem);
+    
     return newQueueItem;
+  } catch (error) {
+    logger.error(`Error al añadir a la cola: ${queueItem.conversationId}`, { error });
+    throw error;
   }
+}
+
+/**
+ * Cargar mensajes existentes para un elemento de la cola
+ * (Esta función evita duplicaciones al cargar mensajes)
+ */
+private async loadMessagesForQueueItem(queueItem: QueueItem): Promise<void> {
+  try {
+    // Solo cargar mensajes si están vacíos
+    if (queueItem.messages.length === 0) {
+      const messages = await this.getMessages(queueItem.conversationId);
+      queueItem.messages = messages;
+      logger.debug(`Cargados ${messages.length} mensajes para ${queueItem.conversationId}`);
+    }
+  } catch (error) {
+    logger.error(`Error al cargar mensajes para ${queueItem.conversationId}`, { error });
+  }
+}
 
   /**
    * Asignar un agente a una conversación
@@ -160,16 +224,15 @@ class QueueService {
     try {
       // Actualizar en SQLite
       const db = await initDatabaseConnection();
-      await db.run(
-        'UPDATE queue SET assignedAgent = ? WHERE conversationId = ?',
-        [agentId, conversationId]
-      );
+      
+      db.prepare(
+        'UPDATE queue SET assignedAgent = ? WHERE conversationId = ?'
+      ).run(agentId, conversationId);
       
       // Actualizar estado de la conversación
-      await db.run(
-        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?',
-        [ConversationStatus.ASSIGNED, Date.now(), conversationId]
-      );
+      db.prepare(
+        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?'
+      ).run(ConversationStatus.ASSIGNED, Date.now(), conversationId);
       
       // Añadir mensaje de sistema
       await this.addSystemMessage(conversationId, `Agente ${agentId} se ha unido a la conversación`);
@@ -186,91 +249,103 @@ class QueueService {
     }
   }
 
-  /**
-   * Finalizar una conversación y eliminarla de la cola
-   */
-  public async completeConversation(conversationId: string): Promise<boolean> {
-    if (!this.agentQueues.has(conversationId)) {
-      logger.warn(`Intento de completar conversación inexistente: ${conversationId}`);
-      return false;
-    }
+/**
+ * Finalizar una conversación y eliminarla de la cola
+ */
+public async completeConversation(conversationId: string): Promise<boolean> {
+  if (!this.agentQueues.has(conversationId)) {
+    logger.warn(`Intento de completar conversación inexistente en cola: ${conversationId}`);
+    return false;
+  }
+  
+  // Obtener la conversación antes de eliminarla
+  const conversation = this.agentQueues.get(conversationId);
+  
+  // Eliminar de la memoria
+  this.agentQueues.delete(conversationId);
+  
+  try {
+    const db = await initDatabaseConnection();
     
-    // Obtener la conversación antes de eliminarla
-    const conversation = this.agentQueues.get(conversationId);
-    
-    // Eliminar de la memoria
-    this.agentQueues.delete(conversationId);
-    
-    try {
-      const db = await initDatabaseConnection();
-      
+    // Usar una transacción para garantizar que todas las operaciones se completen
+    const transaction = db.transaction(() => {
       // Actualizar estado en la base de datos (no eliminar para mantener historial)
-      await db.run(
-        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?',
-        [ConversationStatus.COMPLETED, Date.now(), conversationId]
-      );
+      db.prepare(
+        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?'
+      ).run(ConversationStatus.COMPLETED, Date.now(), conversationId);
       
       // Eliminar de la cola
-      await db.run('DELETE FROM queue WHERE conversationId = ?', [conversationId]);
-      
-      // Notificar actualización
-      this.notifyQueueUpdated();
-      
-      logger.info(`Conversación ${conversationId} completada y eliminada de la cola`);
-      
-      // Emitir evento de conversación completada con datos para análisis
-      if (conversation) {
-        this.events.emit('conversation:completed', {
-          conversationId,
-          startTime: conversation.startTime,
-          endTime: Date.now(),
-          messageCount: conversation.messages.length,
-          assignedAgent: conversation.assignedAgent
-        });
-      }
-      
-      return true;
-    } catch (error) {
-      logger.error(`Error al completar conversación ${conversationId}`, { error });
-      return false;
+      db.prepare('DELETE FROM queue WHERE conversationId = ?').run(conversationId);
+    });
+    
+    // Ejecutar la transacción
+    transaction();
+    
+    // Notificar actualización
+    this.notifyQueueUpdated();
+    
+    logger.info(`Conversación ${conversationId} completada y eliminada de la cola`);
+    
+    // Emitir evento de conversación completada con datos para análisis
+    if (conversation) {
+      this.events.emit('conversation:completed', {
+        conversationId,
+        startTime: conversation.startTime,
+        endTime: Date.now(),
+        messageCount: conversation.messages.length,
+        assignedAgent: conversation.assignedAgent
+      });
     }
+    
+    return true;
+  } catch (error) {
+    logger.error(`Error al completar conversación ${conversationId}`, { error });
+    
+    // Si ocurre un error, intentar volver a añadir la conversación a la memoria
+    // para evitar pérdida de datos
+    if (conversation) {
+      this.agentQueues.set(conversationId, conversation);
+    }
+    
+    return false;
   }
+}
 
   /**
    * Añadir un mensaje a una conversación
    */
   public async addMessage(conversationId: string, message: Omit<Message, 'id' | 'conversationId' | 'timestamp'>): Promise<Message | null> {
     // Verificar si es un número de teléfono o un conversationId real
-  let queueItem = this.agentQueues.get(conversationId);
+    let queueItem = this.agentQueues.get(conversationId);
   
-  // Si no encontramos la conversación, verificar si conversationId es un número de teléfono
-  if (!queueItem) {
-    // Buscar conversación por número en nuestras conversaciones
-    for (const item of this.agentQueues.values()) {
-      if (item.from === conversationId) {
-        queueItem = item;
-        logger.warn(`Intento de usar número (${conversationId}) como conversationId, usando ID correcto: ${queueItem.conversationId}`);
-        // Usar el conversationId correcto
-        conversationId = queueItem.conversationId;
-        break;
+    // Si no encontramos la conversación, verificar si conversationId es un número de teléfono
+    if (!queueItem) {
+      // Buscar conversación por número en nuestras conversaciones
+      for (const item of this.agentQueues.values()) {
+        if (item.from === conversationId) {
+          queueItem = item;
+          logger.warn(`Intento de usar número (${conversationId}) como conversationId, usando ID correcto: ${queueItem.conversationId}`);
+          // Usar el conversationId correcto
+          conversationId = queueItem.conversationId;
+          break;
+        }
       }
     }
-  }
   
-  if (!queueItem) {
-    logger.warn(`Intento de añadir mensaje a conversación inexistente: ${conversationId}`);
-    return null;
-  }
+    if (!queueItem) {
+      logger.warn(`Intento de añadir mensaje a conversación inexistente: ${conversationId}`);
+      return null;
+    }
 
-    // Crear un nuevo ID para el mensaje si no se proporciona
-  const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    // Crear un nuevo ID para el mensaje
+    const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
     const newMessage: Message = {
-    id: messageId,
-    conversationId,
-    ...message,
-    timestamp: Date.now()
-  };
+      id: messageId,
+      conversationId,
+      ...message,
+      timestamp: Date.now()
+    };
     
     // Añadir a memoria
     queueItem.messages.push(newMessage);
@@ -282,27 +357,25 @@ class QueueService {
       // Convertir metadata a JSON si existe
       const metadataJson = newMessage.metadata ? JSON.stringify(newMessage.metadata) : null;
       
-      await db.run(
+      db.prepare(
         `INSERT INTO messages
          (id, conversationId, from_type, text, timestamp, agentId, attachmentUrl, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          newMessage.id,
-          newMessage.conversationId,
-          newMessage.from,
-          newMessage.text,
-          newMessage.timestamp,
-          newMessage.agentId || null,
-          newMessage.attachmentUrl || null,
-          metadataJson
-        ]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        newMessage.id,
+        newMessage.conversationId,
+        newMessage.from,
+        newMessage.text,
+        newMessage.timestamp,
+        newMessage.agentId || null,
+        newMessage.attachmentUrl || null,
+        metadataJson
       );
       
       // Actualizar timestamp de actividad en la conversación
-      await db.run(
-        'UPDATE conversations SET lastActivity = ? WHERE conversationId = ?',
-        [Date.now(), conversationId]
-      );
+      db.prepare(
+        'UPDATE conversations SET lastActivity = ? WHERE conversationId = ?'
+      ).run(Date.now(), conversationId);
       
       // Notificar actualización
       this.notifyConversationUpdated(conversationId);
@@ -348,40 +421,49 @@ class QueueService {
     return this.agentQueues.get(conversationId);
   }
 
-  /**
-   * Obtener mensajes de una conversación
-   */
-  public async getMessages(conversationId: string): Promise<Message[]> {
-    // Primero intentar desde memoria
-    const queueItem = this.agentQueues.get(conversationId);
+/**
+ * Obtener mensajes de una conversación
+ */
+public async getMessages(conversationId: string): Promise<Message[]> {
+  try {
+    // Buscar directamente en la base de datos para garantizar consistencia
+    // Esto evita mezclar mensajes de la memoria y la base de datos
+    const db = await initDatabaseConnection();
     
+    logger.debug(`Obteniendo mensajes para conversación ${conversationId} directamente desde BD`);
+    
+    const messages = db.prepare(
+      'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC'
+    ).all(conversationId);
+    
+    // Convertir a formato esperado
+    const formattedMessages = messages.map((msg: any) => ({
+      id: msg.id,
+      conversationId: msg.conversationId,
+      from: msg.from_type as MessageSender,
+      text: msg.text,
+      timestamp: msg.timestamp,
+      agentId: msg.agentId || undefined,
+      attachmentUrl: msg.attachmentUrl || undefined,
+      metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
+    }));
+    
+    logger.debug(`Recuperados ${formattedMessages.length} mensajes para conversación ${conversationId}`);
+    
+    return formattedMessages;
+  } catch (error) {
+    logger.error(`Error al obtener mensajes para conversación ${conversationId}`, { error });
+    
+    // Intentar recuperar desde la memoria como fallback
+    const queueItem = this.agentQueues.get(conversationId);
     if (queueItem) {
+      logger.warn(`Fallback: Utilizando mensajes en memoria para ${conversationId} (${queueItem.messages.length} mensajes)`);
       return queueItem.messages;
     }
     
-    // Si no está en memoria, buscar en SQLite
-    try {
-      const db = await initDatabaseConnection();
-      const messages = await db.all(
-        'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
-        [conversationId]
-      );
-      
-      return messages.map((msg: any) => ({
-        id: msg.id,
-        conversationId: msg.conversationId,
-        from: msg.from_type as MessageSender,
-        text: msg.text,
-        timestamp: msg.timestamp,
-        agentId: msg.agentId || undefined,
-        attachmentUrl: msg.attachmentUrl || undefined,
-        metadata: msg.metadata ? JSON.parse(msg.metadata) : undefined
-      }));
-    } catch (error) {
-      logger.error(`Error al obtener mensajes desde SQLite: ${conversationId}`, { error });
-      return [];
-    }
+    return [];
   }
+}
 
   /**
    * Actualizar prioridad de una conversación
@@ -406,10 +488,9 @@ class QueueService {
     try {
       // Actualizar en SQLite
       const db = await initDatabaseConnection();
-      await db.run(
-        'UPDATE queue SET priority = ? WHERE conversationId = ?',
-        [priority, conversationId]
-      );
+      db.prepare(
+        'UPDATE queue SET priority = ? WHERE conversationId = ?'
+      ).run(priority, conversationId);
       
       // Añadir mensaje de sistema si la prioridad es alta
       if (priority >= 3) {
@@ -450,10 +531,9 @@ class QueueService {
       const db = await initDatabaseConnection();
       const tagsJson = JSON.stringify(tags);
       
-      await db.run(
-        'UPDATE queue SET tags = ? WHERE conversationId = ?',
-        [tagsJson, conversationId]
-      );
+      db.prepare(
+        'UPDATE queue SET tags = ? WHERE conversationId = ?'
+      ).run(tagsJson, conversationId);
       
       // Notificar actualización
       this.notifyQueueUpdated();
@@ -489,10 +569,9 @@ class QueueService {
       const db = await initDatabaseConnection();
       const metadataJson = JSON.stringify(queueItem.metadata);
       
-      await db.run(
-        'UPDATE queue SET metadata = ? WHERE conversationId = ?',
-        [metadataJson, conversationId]
-      );
+      db.prepare(
+        'UPDATE queue SET metadata = ? WHERE conversationId = ?'
+      ).run(metadataJson, conversationId);
       
       logger.debug(`Metadata de conversación ${conversationId} actualizada`);
       
