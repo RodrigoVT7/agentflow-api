@@ -28,25 +28,24 @@ class QueueService {
     try {
       const db = await initDatabaseConnection();
       
-      // Obtener conversaciones en cola
-      const queueItems = await db.all('SELECT * FROM queue');
+      // Get conversations in queue - use prepared statement
+      const queueItems = db.prepare('SELECT * FROM queue').all();
       
       if (queueItems && queueItems.length > 0) {
-        // Limpiar el mapa actual
+        // Clear current map
         this.agentQueues.clear();
         
         for (const item of queueItems) {
-          // Cargar los mensajes asociados a esta conversación
-          const messages = await db.all(
-            'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
-            [item.conversationId]
-          );
+          // Load messages associated with this conversation - use prepared statement
+          const messages = db.prepare(
+            'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC'
+          ).all(item.conversationId);
           
-          // Convertir las cadenas JSON a objetos
+          // Convert JSON strings to objects
           const tags = item.tags ? JSON.parse(item.tags) : [];
           const metadata = item.metadata ? JSON.parse(item.metadata) : {};
           
-          // Crear objeto de cola en memoria
+          // Create queue item in memory
           const queueItem: QueueItem = {
             conversationId: item.conversationId,
             from: item.from_number,
@@ -71,10 +70,13 @@ class QueueService {
           this.agentQueues.set(item.conversationId, queueItem);
         }
         
-        logger.info(`Cargadas ${queueItems.length} conversaciones en cola desde SQLite`);
+        logger.info(`Loaded ${queueItems.length} conversations in queue from SQLite`);
       }
     } catch (error) {
-      logger.error('Error al cargar estado inicial de cola desde SQLite', { error });
+      logger.error('Error loading initial queue state from SQLite', { 
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      });
     }
   }
 
@@ -138,6 +140,12 @@ class QueueService {
     if (!queueItem) {
       logger.warn(`Intento de asignar agente a conversación inexistente: ${conversationId}`);
       return false;
+    }
+    
+    // Si ya está asignado a este mismo agente, no hacer nada para evitar duplicados
+    if (queueItem.assignedAgent === agentId) {
+      logger.debug(`Agente ${agentId} ya está asignado a conversación ${conversationId}, evitando mensaje duplicado`);
+      return true;
     }
     
     // Si ya está asignado a otro agente, no permitir reasignación

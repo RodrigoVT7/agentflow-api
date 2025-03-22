@@ -5,8 +5,8 @@
   "main": "dist/app.js",
   "scripts": {
     "ts": "tsc -w",
-    "dev": "nodemon ./build/app.js",
-    "start": "tsc && node ./build/app.js"
+    "dev": "nodemon ./dist/app.js",
+    "start": "tsc && node ./dist/app.js"
   },
   "keywords": [],
   "author": "",
@@ -14,6 +14,7 @@
   "dependencies": {
     "abort-controller": "^3.0.0",
     "bcrypt": "^5.1.1",
+    "better-sqlite3": "^11.9.1",
     "compression": "^1.8.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
@@ -24,13 +25,12 @@
     "mysql2": "^3.12.0",
     "node-fetch": "^3.3.2",
     "pg": "^8.13.3",
-    "sqlite": "^5.1.1",
-    "sqlite3": "^5.1.7",
     "uuid": "^11.1.0",
     "ws": "^8.18.1"
   },
   "devDependencies": {
     "@types/bcrypt": "^5.0.2",
+    "@types/better-sqlite3": "^7.6.12",
     "@types/compression": "^1.7.5",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",

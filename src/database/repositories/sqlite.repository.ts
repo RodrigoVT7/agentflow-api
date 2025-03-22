@@ -24,41 +24,42 @@ export class SQLiteRepository<T> implements IRepository<T> {
   /**
    * Crear un nuevo registro
    */
-  async create(data: T): Promise<T> {
-    try {
-      const db = await initDatabaseConnection();
-      
-      // Generar ID si no existe
-      const newItem = { ...data } as any;
-      if (!newItem[this.idField]) {
-        newItem[this.idField] = uuidv4();
-      }
-      
-      // Convertir objeto a pares columna-valor
-      const columns = Object.keys(newItem);
-      const values = Object.values(newItem).map(value => {
-        if (value === null || value === undefined) {
-          return null;
-        }
-        if (typeof value === 'object') {
-          return JSON.stringify(value);
-        }
-        return value;
-      });
-      
-      // Crear consulta
-      const placeholders = columns.map(() => '?').join(', ');
-      const query = `INSERT INTO ${this.tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
-      
-      // Ejecutar consulta
-      await db.run(query, values);
-      
-      return newItem;
-    } catch (error) {
-      logger.error(`Error al crear en ${this.tableName}`, { error });
-      throw error;
+// Update the repository methods to use better-sqlite3 synchronous API
+async create(data: T): Promise<T> {
+  try {
+    const db = await initDatabaseConnection();
+    
+    // Generate ID if it doesn't exist
+    const newItem = { ...data } as any;
+    if (!newItem[this.idField]) {
+      newItem[this.idField] = uuidv4();
     }
+    
+    // Convert object to column-value pairs
+    const columns = Object.keys(newItem);
+    const values = Object.values(newItem).map(value => {
+      if (value === null || value === undefined) {
+        return null;
+      }
+      if (typeof value === 'object') {
+        return JSON.stringify(value);
+      }
+      return value;
+    });
+    
+    // Create query
+    const placeholders = columns.map(() => '?').join(', ');
+    const query = `INSERT INTO ${this.tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
+    
+    // Execute query - better-sqlite3 is synchronous
+    db.prepare(query).run(...values);
+    
+    return newItem;
+  } catch (error) {
+    logger.error(`Error creating in ${this.tableName}`, { error });
+    throw error;
   }
+}
 
   /**
    * Buscar por ID
@@ -68,7 +69,7 @@ export class SQLiteRepository<T> implements IRepository<T> {
       const db = await initDatabaseConnection();
       
       const query = `SELECT * FROM ${this.tableName} WHERE ${this.idField} = ?`;
-      const item = await db.get(query, [id]);
+      const item = db.prepare(query).get(id);
       
       if (!item) {
         return null;
@@ -113,7 +114,8 @@ export class SQLiteRepository<T> implements IRepository<T> {
         }
       }
       
-      const items = await db.all(query, params);
+      const stmt = db.prepare(query);
+      const items = params.length > 0 ? stmt.all(...params) : stmt.all();
       
       // Convertir campos JSON a objetos
       const result = items.map((item: any) => this.parseJsonFields(item));

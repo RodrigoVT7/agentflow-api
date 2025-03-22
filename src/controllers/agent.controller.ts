@@ -455,21 +455,19 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
   try {
     const db = await initDatabaseConnection();
     
-    // Obtener conversaciones con status COMPLETED
-    const completedConversations = await db.all(
-      'SELECT * FROM conversations WHERE status = ? ORDER BY lastActivity DESC LIMIT 50',
-      [ConversationStatus.COMPLETED]
-    );
+    // Get conversations with status COMPLETED
+    const completedConversations = db.prepare(
+      'SELECT * FROM conversations WHERE status = ? ORDER BY lastActivity DESC LIMIT 50'
+    ).all(ConversationStatus.COMPLETED);
     
-    // Para cada conversación, obtener sus mensajes asociados
+    // For each conversation, get associated messages
     const result = [];
     for (const conv of completedConversations) {
-      const messages = await db.all(
-        'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
-        [conv.conversationId]
-      );
+      const messages = db.prepare(
+        'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC'
+      ).all(conv.conversationId);
       
-      // Convertir a formato esperado por el cliente
+      // Convert to expected format for client
       const queueItem = {
         conversationId: conv.conversationId,
         from: conv.from_number,
@@ -492,8 +490,8 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
           isCompleted: true,
           completedAt: conv.lastActivity,
           completedTimestamp: conv.lastActivity,
-          uniqueSessionId: conv.conversationId, // Añadir el ID único de la sesión
-          sessionStartDate: new Date(conv.startTime || (conv.lastActivity - (24 * 60 * 60 * 1000))).toISOString().split('T')[0] // Fecha de inicio para distinguir
+          uniqueSessionId: conv.conversationId,
+          sessionStartDate: new Date(conv.startTime || (conv.lastActivity - (24 * 60 * 60 * 1000))).toISOString().split('T')[0]
         }
       };
       
@@ -502,9 +500,9 @@ public getCompletedConversations = async (req: Request, res: Response, next: Nex
     
     res.json(result);
   } catch (error) {
-    logger.error('Error en getCompletedConversations', { error });
+    logger.error('Error in getCompletedConversations', { error });
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Error al obtener conversaciones completadas' });
+      res.status(500).json({ error: 'Error getting completed conversations' });
     }
   }
 };

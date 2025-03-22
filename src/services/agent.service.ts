@@ -108,28 +108,28 @@ export class AgentService {
   public async deleteAgent(id: string): Promise<boolean> {
     const result = agentsDB.delete(id);
     
-    // Eliminar de la base de datos
+    // Delete from database
     try {
       const db = await initDatabaseConnection();
-      await db.run('DELETE FROM agents WHERE id = ?', [id]);
+      db.prepare('DELETE FROM agents WHERE id = ?').run(id);
     } catch (error) {
-      logger.error('Error al eliminar agente de SQLite', { error, agentId: id });
+      logger.error('Error deleting agent from SQLite', { error, agentId: id });
     }
     
     return result;
   }
 
-  // Cargar agentes desde SQLite
   public async loadAgentsFromDB(): Promise<void> {
     try {
       const db = await initDatabaseConnection();
-      const dbAgents = await db.all('SELECT * FROM agents');
+      // better-sqlite3 uses .all() synchronously
+      const dbAgents = db.prepare('SELECT * FROM agents').all();
       
       if (dbAgents && dbAgents.length > 0) {
-        // Limpiar mapa actual
+        // Clear current map
         agentsDB.clear();
         
-        // Cargar agentes desde la base de datos
+        // Load agents from database
         for (const dbAgent of dbAgents) {
           const agent: Agent & { password: string } = {
             id: dbAgent.id,
@@ -146,101 +146,135 @@ export class AgentService {
           agentsDB.set(agent.id, agent);
         }
         
-        logger.info(`${dbAgents.length} agentes cargados desde SQLite`);
+        logger.info(`${dbAgents.length} agents loaded from SQLite`);
       } else {
-        // Si no hay agentes, crear los predeterminados
+        // If no agents, create default ones
         await this.initDefaultAgents();
       }
     } catch (error) {
-      logger.error('Error al cargar agentes desde SQLite', { error });
+      logger.error('Error loading agents from SQLite', { error });
       
-      // Si hay error al cargar, inicializar con agentes predeterminados
+      // If error loading, initialize with default agents
       await this.initDefaultAgents();
     }
   }
 
-  // Inicializar 5 agentes predeterminados
-  public async initDefaultAgents(): Promise<void> {
-    try {
-      // Verificar si ya existen agentes
-      const agents = Array.from(agentsDB.values());
-      if (agents.length > 0) {
-        logger.info(`Ya existen ${agents.length} agentes en el sistema`);
-        return;
-      }
-      
-      const hashedPassword = await bcrypt.hash('agent123', 10);
-      const adminPassword = await bcrypt.hash('admin123', 10);
-      
-      // Crear 5 agentes predeterminados
-      const defaultAgents = [
-        {
-          id: 'agent_1',
-          name: 'Agente 1',
-          email: 'agent1@example.com',
-          password: hashedPassword,
-          status: AgentStatus.ONLINE,
-          activeConversations: [],
-          maxConcurrentChats: 3,
-          role: 'agent' as 'agent' | 'supervisor' | 'admin',
-          lastActivity: Date.now()
-        },
-        {
-          id: 'agent_2',
-          name: 'Agente 2',
-          email: 'agent2@example.com',
-          password: hashedPassword,
-          status: AgentStatus.ONLINE,
-          activeConversations: [],
-          maxConcurrentChats: 3,
-          role: 'agent' as 'agent' | 'supervisor' | 'admin',
-          lastActivity: Date.now()
-        },
-        {
-          id: 'agent_3',
-          name: 'Agente 3',
-          email: 'agent3@example.com',
-          password: hashedPassword,
-          status: AgentStatus.ONLINE,
-          activeConversations: [],
-          maxConcurrentChats: 3,
-          role: 'agent' as 'agent' | 'supervisor' | 'admin',
-          lastActivity: Date.now()
-        },
-        {
-          id: 'supervisor_1',
-          name: 'Supervisor',
-          email: 'supervisor@example.com',
-          password: hashedPassword,
-          status: AgentStatus.ONLINE,
-          activeConversations: [],
-          maxConcurrentChats: 5,
-          role: 'supervisor' as 'agent' | 'supervisor' | 'admin',
-          lastActivity: Date.now()
-        },
-        {
-          id: 'admin_1',
-          name: 'Administrador',
-          email: 'admin@example.com',
-          password: adminPassword,
-          status: AgentStatus.ONLINE,
-          activeConversations: [],
-          maxConcurrentChats: 10,
-          role: 'admin' as 'agent' | 'supervisor' | 'admin',
-          lastActivity: Date.now()
-        }
-      ];
-      
-      // Registrar todos los agentes
-      for (const agent of defaultAgents) {
-        await this.setAgent(agent);
-      }
-      
-      logger.info('5 agentes predeterminados creados correctamente');
-    } catch (error) {
-      logger.error('Error al crear agentes predeterminados', { error });
+// src/services/agent.service.ts
+public async initDefaultAgents(): Promise<void> {
+  try {
+    // Verify if agents already exist
+    const agents = Array.from(agentsDB.values());
+    if (agents.length > 0) {
+      logger.info(`Already have ${agents.length} agents in the system`);
+      return;
     }
+    
+    const hashedPassword = await bcrypt.hash('agent123', 10);
+    const adminPassword = await bcrypt.hash('admin123', 10);
+    
+    // Create the database connection
+    const db = await initDatabaseConnection();
+    
+    // Begin a transaction for all inserts
+    const transaction = db.transaction((defaultAgents: any) => {
+      const insertStmt = db.prepare(`
+        INSERT INTO agents
+        (id, name, email, password, status, activeConversations, maxConcurrentChats, role, lastActivity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      
+      for (const agent of defaultAgents) {
+        // Convert array to string for SQLite storage
+        const activeConversationsStr = JSON.stringify(agent.activeConversations);
+        
+        insertStmt.run(
+          agent.id,
+          agent.name,
+          agent.email,
+          agent.password,
+          agent.status,
+          activeConversationsStr,
+          agent.maxConcurrentChats,
+          agent.role,
+          agent.lastActivity
+        );
+        
+        // Also add to memory map
+        agentsDB.set(agent.id, agent);
+      }
+    });
+    
+    // Create default agents array
+    const defaultAgents = [
+      {
+        id: 'agent_1',
+        name: 'Agente 1',
+        email: 'agent1@example.com',
+        password: hashedPassword,
+        status: AgentStatus.ONLINE,
+        activeConversations: [],
+        maxConcurrentChats: 3,
+        role: 'agent' as 'agent' | 'supervisor' | 'admin',
+        lastActivity: Date.now()
+      },
+      {
+        id: 'agent_2',
+        name: 'Agente 2',
+        email: 'agent2@example.com',
+        password: hashedPassword,
+        status: AgentStatus.ONLINE,
+        activeConversations: [],
+        maxConcurrentChats: 3,
+        role: 'agent' as 'agent' | 'supervisor' | 'admin',
+        lastActivity: Date.now()
+      },
+      {
+        id: 'agent_3',
+        name: 'Agente 3',
+        email: 'agent3@example.com',
+        password: hashedPassword,
+        status: AgentStatus.ONLINE,
+        activeConversations: [],
+        maxConcurrentChats: 3,
+        role: 'agent' as 'agent' | 'supervisor' | 'admin',
+        lastActivity: Date.now()
+      },
+      {
+        id: 'supervisor_1',
+        name: 'Supervisor',
+        email: 'supervisor@example.com',
+        password: hashedPassword,
+        status: AgentStatus.ONLINE,
+        activeConversations: [],
+        maxConcurrentChats: 5,
+        role: 'supervisor' as 'agent' | 'supervisor' | 'admin',
+        lastActivity: Date.now()
+      },
+      {
+        id: 'admin_1',
+        name: 'Administrador',
+        email: 'admin@example.com',
+        password: adminPassword,
+        status: AgentStatus.ONLINE,
+        activeConversations: [],
+        maxConcurrentChats: 10,
+        role: 'admin' as 'agent' | 'supervisor' | 'admin',
+        lastActivity: Date.now()
+      }
+    ];
+    
+    // Execute the transaction with our agents array
+    transaction(defaultAgents);
+    
+    logger.info('5 default agents created successfully');
+  } catch (error) {
+    // More detailed error logging
+    logger.error('Error creating default agents', { 
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
   }
+}
 }
 
 // Instancia singleton

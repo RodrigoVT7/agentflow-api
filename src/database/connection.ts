@@ -1,16 +1,15 @@
 // src/database/connection.ts
-import sqlite3 from 'sqlite3';
-import { open } from 'sqlite';
+import Database from 'better-sqlite3';
 import dbConfig from '../config/database.config';
 import logger from '../utils/logger';
 import fs from 'fs';
 import path from 'path';
 
-// Variable para almacenar la conexión activa
+// Variable to store the active connection
 let connection: any = null;
 
 /**
- * Inicializar conexión a SQLite y crear tablas
+ * Initialize SQLite connection and create tables
  */
 export async function initDatabaseConnection(): Promise<any> {
   if (connection) {
@@ -18,35 +17,38 @@ export async function initDatabaseConnection(): Promise<any> {
   }
   
   try {
-    // Asegurar que el directorio existe
+    // Ensure directory exists
     const dir = path.dirname(dbConfig.filePath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
     
-    // Conectar a SQLite
-    connection = await open({
-      filename: dbConfig.filePath,
-      driver: sqlite3.Database
+    // Connect to SQLite - better-sqlite3 is synchronous
+    connection = new Database(dbConfig.filePath, { 
+      verbose: process.env.NODE_ENV === 'development' ? console.log : undefined
     });
     
-    // Inicializar tablas
-    await initializeTables(connection);
+    // Enable foreign keys
+    connection.pragma('foreign_keys = ON');
     
-    logger.info('Conexión a SQLite establecida correctamente');
+    // Initialize tables
+    initializeTables(connection);
+    
+    const result = connection.prepare('SELECT * FROM agents').all();
+    logger.info(`Test query successful. Found ${result.length} agents.`);
     return connection;
   } catch (error) {
-    logger.error(`Error al conectar a SQLite`, { error });
+    logger.error(`Error connecting to SQLite`, { error });
     throw error;
   }
 }
 
 /**
- * Inicializar tablas en la base de datos
+ * Initialize tables in the database
  */
-async function initializeTables(db: any): Promise<void> {
-  // Crear tabla de agentes
-  await db.exec(`
+function initializeTables(db: any): void {
+  // Create agents table
+  db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -60,8 +62,8 @@ async function initializeTables(db: any): Promise<void> {
     )
   `);
   
-  // Crear tabla de conversaciones
-  await db.exec(`
+  // Create conversations table
+  db.exec(`
     CREATE TABLE IF NOT EXISTS conversations (
       conversationId TEXT PRIMARY KEY,
       token TEXT NOT NULL,
@@ -73,8 +75,8 @@ async function initializeTables(db: any): Promise<void> {
     )
   `);
   
-  // Crear tabla de mensajes
-  await db.exec(`
+  // Create messages table
+  db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
       conversationId TEXT NOT NULL,
@@ -88,8 +90,8 @@ async function initializeTables(db: any): Promise<void> {
     )
   `);
   
-  // Crear tabla para cola de espera
-  await db.exec(`
+  // Create queue table
+  db.exec(`
     CREATE TABLE IF NOT EXISTS queue (
       conversationId TEXT PRIMARY KEY,
       from_number TEXT NOT NULL,
@@ -103,11 +105,11 @@ async function initializeTables(db: any): Promise<void> {
     )
   `);
   
-  logger.info('Tablas SQLite inicializadas correctamente');
+  logger.info('SQLite tables initialized successfully');
 }
 
 /**
- * Cerrar conexión a la base de datos
+ * Close database connection
  */
 export async function closeDatabaseConnection(): Promise<void> {
   if (!connection) {
@@ -115,11 +117,11 @@ export async function closeDatabaseConnection(): Promise<void> {
   }
   
   try {
-    await connection.close();
+    connection.close();
     connection = null;
-    logger.info('Conexión a SQLite cerrada correctamente');
+    logger.info('SQLite connection closed successfully');
   } catch (error) {
-    logger.error('Error al cerrar conexión a SQLite', { error });
+    logger.error('Error closing SQLite connection', { error });
     throw error;
   }
 }

@@ -46,28 +46,26 @@ class ConversationService {
     try {
       const db = await initDatabaseConnection();
       
-      // Obtener conversaciones activas (no completadas)
-      const dbConversations = await db.all(
-        `SELECT * FROM conversations WHERE status != ?`, 
-        [ConversationStatus.COMPLETED]
-      );
+      // Get active conversations (not completed) - use prepared statement
+      const dbConversations = db.prepare(
+        `SELECT * FROM conversations WHERE status != ?`
+      ).all(ConversationStatus.COMPLETED);
       
       if (dbConversations && dbConversations.length > 0) {
         for (const dbConv of dbConversations) {
-          // Solo cargar en memoria las conversaciones recientes (menos de 24 horas)
+          // Only load recent conversations (less than 24 hours)
           const lastActivity = dbConv.lastActivity;
           const now = Date.now();
           
-          // Si la conversación tiene más de 24 horas de inactividad, marcarla como completada
+          // If conversation is inactive for more than 24 hours, mark as completed
           if (now - lastActivity > 24 * 60 * 60 * 1000) {
-            await db.run(
-              `UPDATE conversations SET status = ? WHERE conversationId = ?`,
-              [ConversationStatus.COMPLETED, dbConv.conversationId]
-            );
+            db.prepare(
+              `UPDATE conversations SET status = ? WHERE conversationId = ?`
+            ).run(ConversationStatus.COMPLETED, dbConv.conversationId);
             continue;
           }
           
-          // Cargar conversación activa en memoria
+          // Load active conversation into memory
           const conversation: ConversationData = {
             conversationId: dbConv.conversationId,
             token: dbConv.token,
@@ -81,10 +79,13 @@ class ConversationService {
           this.conversations.set(dbConv.from_number, conversation);
         }
         
-        logger.info(`${this.conversations.size} conversaciones activas cargadas desde la base de datos`);
+        logger.info(`${this.conversations.size} active conversations loaded from database`);
       }
     } catch (error) {
-      logger.error('Error al cargar conversaciones desde la base de datos', { error });
+      logger.error('Error loading conversations from database', { 
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      });
     }
   }
 
@@ -522,53 +523,79 @@ public async getOrCreateConversation(from: string, phone_number_id: string): Pro
   /**
    * Finalizar conversación con agente y volver al bot
    */
-  public async completeAgentConversation(from: string): Promise<boolean> {
-    const conversation = this.conversations.get(from);
-    
-    if (!conversation) {
-      return false;
+// Modificación al método completeAgentConversation en src/services/conversation.service.ts
+
+public async completeAgentConversation(conversationId: string): Promise<boolean> {
+  // Buscar conversación por ID o por número
+  let conversation: ConversationData | undefined;
+  let fromNumber: string | undefined;
+  
+  // Primero intentar buscar por conversationId directamente
+  for (const [from, conv] of this.conversations.entries()) {
+    if (conv.conversationId === conversationId) {
+      conversation = conv;
+      fromNumber = from;
+      break;
     }
-    
-    // Actualizar estado
-    conversation.isEscalated = false;
-    conversation.status = ConversationStatus.COMPLETED;
-    conversation.lastActivity = Date.now();
-    
-    // Actualizar en base de datos usando ID del sistema
-    try {
-      const db = await initDatabaseConnection();
-      await db.run(
-        `UPDATE conversations 
-           SET isEscalated = 0, status = ?, lastActivity = ? 
-           WHERE conversationId = ?`,
-        [conversation.status, conversation.lastActivity, conversation.conversationId]
-      );
-    } catch (error) {
-      logger.error(`Error al actualizar estado de conversación completada: ${from}`, { error });
-    }
-    
-    // Eliminar de la cola de agentes usando ID del sistema
-    const completed = await this.queueService.completeConversation(conversation.conversationId);
-    
-    // Enviar mensaje de finalización
-    if (completed) {
-      const completionMessage = "La conversación con el agente ha finalizado. ¿En qué más puedo ayudarte?";
-      
-      // CORRECCIÓN: Usar phone_number_id como emisor y from como destinatario
-      await this.whatsappService.sendMessage(
-        conversation.phone_number_id,  // ID del número de WhatsApp Business
-        from,  // Número del usuario destinatario
-        completionMessage
-      );
-      
-      // Guardar mensaje de sistema en la base de datos con ID del sistema
-      await this.saveMessage(conversation.conversationId, 'system', completionMessage);
-      
-      logger.info(`Conversación con agente finalizada: ${from}`);
-    }
-    
-    return completed;
   }
+  
+  // Si no encontramos por conversationId, intentar buscar como si el conversationId fuera un número de teléfono
+  if (!conversation && !fromNumber) {
+    conversation = this.conversations.get(conversationId);
+    if (conversation) {
+      fromNumber = conversationId;
+    }
+  }
+  
+  if (!conversation || !fromNumber) {
+    logger.warn(`No se encontró conversación para completar: ${conversationId}`);
+    return false;
+  }
+  
+  // Actualizar estado
+  conversation.isEscalated = false;
+  conversation.status = ConversationStatus.COMPLETED;
+  conversation.lastActivity = Date.now();
+  
+  // Actualizar en base de datos usando ID del sistema
+  try {
+    const db = await initDatabaseConnection();
+    await db.run(
+      `UPDATE conversations 
+         SET isEscalated = 0, status = ?, lastActivity = ? 
+         WHERE conversationId = ?`,
+      [conversation.status, conversation.lastActivity, conversation.conversationId]
+    );
+  } catch (error) {
+    logger.error(`Error al actualizar estado de conversación completada: ${conversationId}`, { error });
+  }
+  
+  // Eliminar de la cola de agentes usando ID del sistema
+  const completed = await this.queueService.completeConversation(conversation.conversationId);
+  
+  // Enviar mensaje de finalización
+  if (completed) {
+    const completionMessage = "La conversación con el agente ha finalizado. ¿En qué más puedo ayudarte?";
+    
+    // CORRECCIÓN: Usar phone_number_id como emisor y from como destinatario
+    await this.whatsappService.sendMessage(
+      conversation.phone_number_id,  // ID del número de WhatsApp Business
+      conversation.from,  // Número del usuario destinatario
+      completionMessage
+    );
+    
+    // Guardar mensaje de sistema en la base de datos con ID del sistema
+    await this.saveMessage(conversation.conversationId, 'system', completionMessage);
+    
+    logger.info(`Conversación con agente finalizada: ${fromNumber}`);
+  }
+  
+  // IMPORTANTE: Eliminar conversación de la memoria para que futuros mensajes creen una nueva
+  this.conversations.delete(fromNumber);
+  logger.info(`Conversación eliminada de la memoria: ${fromNumber}`);
+  
+  return completed;
+}
 
   /**
    * Limpiar conversaciones inactivas (24 horas)
