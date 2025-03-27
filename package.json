@@ -6,7 +6,7 @@
   "scripts": {
     "ts": "tsc -w",
     "dev": "nodemon ./dist/app.js",
-    "start": "tsc && node ./dist/app.js"
+    "start": "npm install && node dist/app.js"
   },
   "keywords": [],
   "author": "",
@@ -25,7 +25,9 @@
     "mysql2": "^3.12.0",
     "node-fetch": "^3.3.2",
     "pg": "^8.13.3",
+    "typescript": "^5.8.2",
     "uuid": "^11.1.0",
+    "winston": "^3.17.0",
     "ws": "^8.18.1"
   },
   "devDependencies": {

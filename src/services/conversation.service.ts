@@ -245,39 +245,58 @@ public async getOrCreateConversation(from: string, phone_number_id: string): Pro
         }
           
         if (message.activities && message.activities.length > 0) {
-          // Buscar respuesta del bot
-          const botResponse = message.activities.find((a: DirectLineActivity) => 
+          // Filtrar todas las respuestas del bot
+          const botResponses = message.activities.filter((a: DirectLineActivity) => 
             a.from?.role === 'bot' && 
             a.type === 'message' &&
             a.text
           );
           
-          if (botResponse && botResponse.text) {
-            // Verificar si es un mensaje de escalamiento
-            if (this.isEscalationMessage(botResponse.text)) {
-              await this.handleEscalation(from, phone_number_id, botResponse.text);
-            } else if (!this.isEscalated(from)) {
-              // Enviar respuesta normal si no está escalado
-              // CORRECCIÓN: Usar phone_number_id como emisor y from como destinatario
-              await this.whatsappService.sendMessage(
-                phone_number_id,  // ID del número de WhatsApp Business
-                from,  // Número del usuario destinatario
-                botResponse.text
-              );
-              
-              // Guardar el mensaje del bot en la base de datos
-              // Obtener conversation para usar su ID del sistema
-              const conversation = this.conversations.get(from);
-              if (conversation) {
-                await this.saveMessage(conversation.conversationId, 'bot', botResponse.text);
-              } else {
-                logger.error(`No se encontró conversación para ${from} al guardar mensaje del bot`);
+          // Ordenar por timestamp si está disponible
+          const sortedResponses = botResponses.sort((a: DirectLineActivity, b: DirectLineActivity) => {
+            const timestampA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+            const timestampB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+            return timestampA - timestampB;  // Orden ascendente por timestamp
+          });
+          
+          // Procesar cada mensaje en orden secuencial
+          for (const botResponse of sortedResponses) {
+            if (botResponse.text) {
+              // Verificar si es un mensaje de escalamiento
+              if (this.isEscalationMessage(botResponse.text)) {
+                await this.handleEscalation(from, phone_number_id, botResponse.text);
+              } else if (!this.isEscalated(from)) {
+                // Enviar respuesta normal si no está escalado
+                try {
+                  await this.whatsappService.sendMessage(
+                    phone_number_id,  // ID del número de WhatsApp Business
+                    from,  // Número del usuario destinatario
+                    botResponse.text
+                  );
+                  
+                  // Guardar el mensaje del bot en la base de datos
+                  const conversation = this.conversations.get(from);
+                  if (conversation) {
+                    await this.saveMessage(conversation.conversationId, 'bot', botResponse.text);
+                  } else {
+                    logger.error(`No se encontró conversación para ${from} al guardar mensaje del bot`);
+                  }
+                  
+                  // Pequeña pausa entre mensajes para asegurar el orden de entrega
+                  // Usar una pausa pequeña para no afectar la experiencia del usuario
+                  await new Promise(resolve => setTimeout(resolve, 300));
+                } catch (sendError) {
+                  logger.error(`Error al enviar mensaje de bot a WhatsApp: ${from}`, { 
+                    error: sendError, 
+                    message: botResponse.text.substring(0, 100) 
+                  });
+                }
               }
             }
-            
-            // Actualizar timestamp de actividad
-            this.updateConversationActivity(from);
           }
+          
+          // Actualizar timestamp de actividad una vez al final del procesamiento
+          this.updateConversationActivity(from);
         }
       } catch (error) {
         console.error('Error al procesar mensaje WebSocket:', error);
@@ -394,6 +413,18 @@ private async saveMessage(conversationId: string, from: string, text: string, ag
     // Guardar mensaje en la base de datos usando ID del sistema
     await this.saveMessage(conversation.conversationId, 'user', message);
     
+      // AÑADIR EL LOG JUSTO AQUÍ 👇
+    logger.info('DEBUG - Variables para DirectLine:', {
+      directlineUrl: `${config.directline.url}/conversations/${conversation.conversationId}/activities`,
+      powerPlatformBaseUrl: config.powerPlatform.baseUrl,
+      botEndpoint: config.powerPlatform.botEndpoint,
+      conversationId: conversation.conversationId,
+      tokenLength: conversation.token.length,
+      fromPrefix: from.substring(0, 5),
+      environment: process.env.NODE_ENV
+    });
+  
+
     // Enviar mensaje al bot
     const response = await fetch(`${config.directline.url}/conversations/${conversation.conversationId}/activities`, {
       method: 'POST',

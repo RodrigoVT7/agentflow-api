@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import agentController from '../controllers/agent.controller';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.middleware';
-
+import config from '../config/app.config';
 const router = Router();
 
 // Rutas públicas para autenticación de agentes
@@ -24,5 +24,37 @@ router.delete('/delete/:agentId', authMiddleware, roleMiddleware(['admin']), age
 
 // Nueva ruta para obtener conversaciones completadas
 router.get('/completed', authMiddleware, agentController.getCompletedConversations);
+
+router.get('/system/health', async (req, res) => {
+    try {
+      // Probar conexión a DirectLine
+      const response = await fetch(
+        `${config.powerPlatform.baseUrl}${config.powerPlatform.botEndpoint}/directline/token?api-version=2022-03-01-preview`
+      );
+      
+      const statusInfo = {
+        directLineStatus: response.ok ? 'OK' : 'ERROR',
+        directLineStatusCode: response.status,
+        directLineMessage: response.ok ? 'Connected' : await response.text(),
+        environment: process.env.NODE_ENV,
+        configValues: {
+          baseUrl: config.powerPlatform.baseUrl ? '✓ Configurado' : '✗ No configurado',
+          botEndpoint: config.powerPlatform.botEndpoint ? '✓ Configurado' : '✗ No configurado',
+          directlineUrl: config.directline.url ? '✓ Configurado' : '✗ No configurado',
+          whatsappToken: config.whatsapp.token ? '✓ Configurado' : '✗ No configurado'
+        },
+        timestamp: new Date().toISOString()
+      };
+      
+      res.json(statusInfo);
+    } catch (error) {
+      res.status(500).json({
+        status: 'ERROR',
+        message: error instanceof Error ? error.message : String(error),
+        stack: process.env.NODE_ENV === 'production' ? null : error instanceof Error ? error.stack : undefined,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
 
 export default router;
