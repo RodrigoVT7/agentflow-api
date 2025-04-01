@@ -256,13 +256,16 @@ public async completeConversation(conversationId: string): Promise<boolean> {
   // Obtener la conversación si existe en memoria
   const conversation = this.agentQueues.get(conversationId);
   
+  // Flag para rastrear si estaba en memoria
+  let wasInMemory = false;
+  
   // Eliminar de la memoria si existe
   if (this.agentQueues.has(conversationId)) {
     this.agentQueues.delete(conversationId);
+    wasInMemory = true;
     logger.info(`Conversación ${conversationId} eliminada de la cola en memoria`);
   } else {
-    logger.warn(`Intento de completar conversación que no está en la cola: ${conversationId}`);
-    // No retornamos false inmediatamente, continuamos para actualizar la BD
+    logger.debug(`Conversación ${conversationId} no encontrada en la cola en memoria`);
   }
   
   try {
@@ -270,53 +273,54 @@ public async completeConversation(conversationId: string): Promise<boolean> {
     
     // Verificar si la conversación existe en la base de datos
     const existsInDB = db.prepare(
-      'SELECT conversationId FROM conversations WHERE conversationId = ?'
+      'SELECT conversationId, status FROM conversations WHERE conversationId = ?'
     ).get(conversationId);
     
     if (!existsInDB) {
       logger.warn(`Conversación ${conversationId} no encontrada en la base de datos`);
-      return false;
+      return wasInMemory; // Retornamos true si al menos la quitamos de memoria
     }
     
-    // Usar una transacción para garantizar que todas las operaciones se completen
-    const transaction = db.transaction(() => {
-      // Actualizar estado en la base de datos (no eliminar para mantener historial)
-      db.prepare(
-        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?'
-      ).run(ConversationStatus.COMPLETED, Date.now(), conversationId);
-      
-      // Eliminar de la cola si existe
+    // Verificar si ya está completada
+    if (existsInDB.status === 'completed') {
+      logger.info(`Conversación ${conversationId} ya estaba marcada como completada en la base de datos`);
+      // Eliminar de la cola si todavía existe un registro
       db.prepare('DELETE FROM queue WHERE conversationId = ?').run(conversationId);
-    });
+      return true;
+    }
     
-    // Ejecutar la transacción
-    transaction();
+    // Actualizar estado en la base de datos usando sentencias individuales
+    // evitando transacciones para reducir posibilidad de errores
+    
+    // 1. Actualizar estado en conversaciones
+    db.prepare(
+      'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?'
+    ).run('completed', Date.now(), conversationId);
+    
+    // 2. Eliminar de la cola
+    db.prepare('DELETE FROM queue WHERE conversationId = ?').run(conversationId);
+    
+    logger.info(`Conversación ${conversationId} marcada como completada en la base de datos`);
     
     // Notificar actualización solo si había una conversación en memoria
-    if (conversation) {
+    if (wasInMemory) {
       this.notifyQueueUpdated();
       
-      // Emitir evento de conversación completada
+      // Emitir evento de conversación completada con datos básicos
       this.events.emit('conversation:completed', {
         conversationId,
-        startTime: conversation.startTime,
-        endTime: Date.now(),
-        messageCount: conversation.messages.length,
-        assignedAgent: conversation.assignedAgent
+        endTime: Date.now()
       });
     }
     
-    logger.info(`Conversación ${conversationId} marcada como completada en la base de datos`);
     return true;
   } catch (error) {
-    logger.error(`Error al completar conversación ${conversationId}`, { error });
+    logger.error(`Error al completar conversación ${conversationId}`, { 
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined 
+    });
     
-    // Si ocurre un error y teníamos la conversación en memoria, intentar restaurarla
-    if (conversation) {
-      this.agentQueues.set(conversationId, conversation);
-    }
-    
-    return false;
+    return wasInMemory; // Retornamos true si al menos la quitamos de memoria
   }
 }
 

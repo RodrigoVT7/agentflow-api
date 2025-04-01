@@ -137,34 +137,145 @@ export class WhatsAppService {
     return cleaned;
   }
 
-  /**
-   * Enviar mensaje de texto a WhatsApp
-   */
-  public async sendMessage(
-    phone_number_id: string,
-    recipient: string,
-    text: string,
-    preview_url: boolean = false
-  ): Promise<boolean> {
-    try {
-      const formattedRecipient = this.formatPhoneNumber(recipient);
-      
-      const message: TextMessage = {
-        messaging_product: "whatsapp",
-        to: formattedRecipient,
-        type: WhatsAppMessageType.TEXT,
-        text: {
-          body: text,
-          preview_url
-        }
-      };
-      
-      return await this.sendWhatsAppRequest(phone_number_id, message);
-    } catch (error) {
-      logger.error('Error al enviar mensaje de texto a WhatsApp', { error, recipient, text });
+/**
+ * Enviar mensaje de texto a WhatsApp
+ */
+public async sendMessage(
+  phone_number_id: string,
+  recipient: string,
+  text: string,
+  preview_url: boolean = false
+): Promise<boolean> {
+  if (!this.token) {
+    logger.error('Error al enviar mensaje: Token de WhatsApp no configurado');
+    return false;
+  }
+
+  if (!phone_number_id || !recipient || !text) {
+    logger.error('Error al enviar mensaje: Parámetros incompletos', { 
+      phone_number_id: phone_number_id || 'VACÍO',
+      recipient: recipient || 'VACÍO', 
+      textLength: text ? text.length : 0 
+    });
+    return false;
+  }
+
+  try {
+    const formattedRecipient = this.formatPhoneNumber(recipient);
+    
+    // Verificar formato del número
+    if (formattedRecipient.length < 10) {
+      logger.error(`Formato de número inválido: ${recipient} -> ${formattedRecipient}`);
       return false;
     }
+    
+    logger.debug(`Preparando envío de mensaje a ${formattedRecipient} vía ${phone_number_id}`);
+    
+    const message: TextMessage = {
+      messaging_product: "whatsapp",
+      to: formattedRecipient,
+      type: WhatsAppMessageType.TEXT,
+      text: {
+        body: text,
+        preview_url
+      }
+    };
+    
+    // Generar URL completa
+    const url = `${this.graphApiBaseUrl}/${this.graphApiVersion}/${phone_number_id}/messages`;
+    
+    logger.debug(`Enviando mensaje a la API de WhatsApp: ${url.substring(0, 100)}...`);
+    
+    let success = false;
+    let retryCount = 0;
+    const maxRetries = whatsappConfig.messageRetryAttempts;
+    
+    while (!success && retryCount < maxRetries) {
+      try {
+        // Usar AbortController para manejar timeouts
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), whatsappConfig.messageTimeout);
+        
+        logger.debug(`Intento ${retryCount + 1}/${maxRetries} de envío de mensaje`);
+        
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(message),
+          signal: controller.signal
+        });
+        
+        // Limpiar el timeout
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          const errorText = await response.text();
+          logger.error(`Error API WhatsApp: ${response.status}`, { 
+            statusText: response.statusText,
+            error: errorText.substring(0, 200)
+          });
+          throw new Error(`Error API WhatsApp: ${response.status} - ${errorText.substring(0, 100)}`);
+        }
+        
+        const responseData: any = await response.json();
+        
+        if (!responseData.messages || !responseData.messages[0] || !responseData.messages[0].id) {
+          logger.warn('Respuesta incompleta de la API de WhatsApp', { 
+            response: JSON.stringify(responseData).substring(0, 200)
+          });
+          throw new Error('Respuesta incompleta de WhatsApp API');
+        }
+        
+        logger.info(`Mensaje enviado a WhatsApp correctamente`, { 
+          phoneNumberId: phone_number_id, 
+          recipient: formattedRecipient,
+          messageId: responseData.messages[0].id 
+        });
+        
+        success = true;
+      } catch (error: any) {
+        retryCount++;
+        
+        const isAbortError = error.name === 'AbortError';
+        const logMessage = isAbortError 
+          ? `Timeout al enviar mensaje después de ${whatsappConfig.messageTimeout}ms` 
+          : 'Error al enviar mensaje a WhatsApp';
+        
+        if (retryCount >= maxRetries) {
+          logger.error(`${logMessage} después de ${maxRetries} intentos`, { 
+            error: isAbortError ? 'Timeout' : (error instanceof Error ? error.message : String(error)), 
+            phoneNumberId: phone_number_id, 
+            recipient: formattedRecipient 
+          });
+          return false;
+        }
+        
+        logger.warn(`Reintentando envío de mensaje (${retryCount}/${maxRetries})`, { 
+          error: isAbortError ? 'Timeout' : (error instanceof Error ? error.message : String(error)), 
+          phoneNumberId: phone_number_id
+        });
+        
+        // Esperar antes de reintentar con backoff exponencial
+        await new Promise(resolve => 
+          setTimeout(resolve, whatsappConfig.messageRetryDelay * Math.pow(2, retryCount - 1))
+        );
+      }
+    }
+    
+    return success;
+  } catch (error) {
+    logger.error('Error general al enviar mensaje de texto a WhatsApp', { 
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      recipient,
+      textPreview: text.substring(0, 30) + (text.length > 30 ? '...' : '')
+    });
+    return false;
   }
+}
 
   /**
    * Enviar mensaje con plantilla a WhatsApp
