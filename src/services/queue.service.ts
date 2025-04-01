@@ -253,19 +253,30 @@ private async loadMessagesForQueueItem(queueItem: QueueItem): Promise<void> {
  * Finalizar una conversación y eliminarla de la cola
  */
 public async completeConversation(conversationId: string): Promise<boolean> {
-  if (!this.agentQueues.has(conversationId)) {
-    logger.warn(`Intento de completar conversación inexistente en cola: ${conversationId}`);
-    return false;
-  }
-  
-  // Obtener la conversación antes de eliminarla
+  // Obtener la conversación si existe en memoria
   const conversation = this.agentQueues.get(conversationId);
   
-  // Eliminar de la memoria
-  this.agentQueues.delete(conversationId);
+  // Eliminar de la memoria si existe
+  if (this.agentQueues.has(conversationId)) {
+    this.agentQueues.delete(conversationId);
+    logger.info(`Conversación ${conversationId} eliminada de la cola en memoria`);
+  } else {
+    logger.warn(`Intento de completar conversación que no está en la cola: ${conversationId}`);
+    // No retornamos false inmediatamente, continuamos para actualizar la BD
+  }
   
   try {
     const db = await initDatabaseConnection();
+    
+    // Verificar si la conversación existe en la base de datos
+    const existsInDB = db.prepare(
+      'SELECT conversationId FROM conversations WHERE conversationId = ?'
+    ).get(conversationId);
+    
+    if (!existsInDB) {
+      logger.warn(`Conversación ${conversationId} no encontrada en la base de datos`);
+      return false;
+    }
     
     // Usar una transacción para garantizar que todas las operaciones se completen
     const transaction = db.transaction(() => {
@@ -274,20 +285,18 @@ public async completeConversation(conversationId: string): Promise<boolean> {
         'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?'
       ).run(ConversationStatus.COMPLETED, Date.now(), conversationId);
       
-      // Eliminar de la cola
+      // Eliminar de la cola si existe
       db.prepare('DELETE FROM queue WHERE conversationId = ?').run(conversationId);
     });
     
     // Ejecutar la transacción
     transaction();
     
-    // Notificar actualización
-    this.notifyQueueUpdated();
-    
-    logger.info(`Conversación ${conversationId} completada y eliminada de la cola`);
-    
-    // Emitir evento de conversación completada con datos para análisis
+    // Notificar actualización solo si había una conversación en memoria
     if (conversation) {
+      this.notifyQueueUpdated();
+      
+      // Emitir evento de conversación completada
       this.events.emit('conversation:completed', {
         conversationId,
         startTime: conversation.startTime,
@@ -297,12 +306,12 @@ public async completeConversation(conversationId: string): Promise<boolean> {
       });
     }
     
+    logger.info(`Conversación ${conversationId} marcada como completada en la base de datos`);
     return true;
   } catch (error) {
     logger.error(`Error al completar conversación ${conversationId}`, { error });
     
-    // Si ocurre un error, intentar volver a añadir la conversación a la memoria
-    // para evitar pérdida de datos
+    // Si ocurre un error y teníamos la conversación en memoria, intentar restaurarla
     if (conversation) {
       this.agentQueues.set(conversationId, conversation);
     }
