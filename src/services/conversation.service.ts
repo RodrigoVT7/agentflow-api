@@ -93,72 +93,83 @@ class ConversationService {
  * Obtener o crear una conversación para un usuario
  */
 public async getOrCreateConversation(from: string, phone_number_id: string): Promise<ConversationData> {
-  // Verificar si ya existe la conversación activa
+  // Verificar si ya existe la conversación activa en memoria
   let conversation = this.conversations.get(from);
   
-  // VERIFICACIÓN ADICIONAL: Si no está en memoria, revisar en BD si hay una completada reciente
+  // Si no está en memoria, verificar si existe en la base de datos
   if (!conversation) {
     try {
       const db = await initDatabaseConnection();
+      
+      // Buscar la conversación más reciente para este número
       const dbConversation = db.prepare(
-        `SELECT * FROM conversations WHERE from_number = ? ORDER BY lastActivity DESC LIMIT 1`
+        `SELECT * FROM conversations 
+         WHERE from_number = ? 
+         ORDER BY lastActivity DESC LIMIT 1`
       ).get(from);
       
+      // Si existe en BD pero está completada, NO cargarla en memoria
+      // para forzar la creación de una nueva conversación
       if (dbConversation) {
-        // Si hay una conversación reciente en BD pero está completada, 
-        // no la cargamos en memoria para forzar creación de una nueva
-        if (dbConversation.status === ConversationStatus.COMPLETED) {
-          logger.info(`Encontrada conversación completada en BD para ${from}, ignorando para crear nueva`);
-          // Continuar flujo normal - dejamos conversation como undefined
-        } 
-        // Si está activa pero no está en memoria, la restauramos
-        else if (dbConversation.status !== ConversationStatus.COMPLETED) {
-          // Si además es reciente (menos de 24 horas)
-          if (Date.now() - dbConversation.lastActivity <= 24 * 60 * 60 * 1000) {
-            conversation = {
-              conversationId: dbConversation.conversationId,
-              token: dbConversation.token,
-              phone_number_id: dbConversation.phone_number_id,
-              from: dbConversation.from_number,
-              isEscalated: dbConversation.isEscalated === 1,
-              lastActivity: dbConversation.lastActivity,
-              status: dbConversation.status as ConversationStatus
-            };
-            
-            this.conversations.set(from, conversation);
-            logger.info(`Restaurada conversación activa ${conversation.conversationId} para ${from} desde BD`);
-          } else {
-            // Está activa en BD pero inactiva por más de 24h, marcarla como completada
-            logger.info(`Conversación ${dbConversation.conversationId} inactiva por >24h, marcando como completada`);
-            db.prepare(
-              `UPDATE conversations SET status = ? WHERE conversationId = ?`
-            ).run(ConversationStatus.COMPLETED, dbConversation.conversationId);
-            // Continuar flujo normal para crear una nueva
-          }
+        // Log detallado para debug
+        logger.debug(`[CONV-VERIFICACION] Conversación encontrada en BD para ${from}:`, {
+          id: dbConversation.conversationId,
+          estado: dbConversation.status,
+          lastActivity: new Date(dbConversation.lastActivity).toISOString(),
+          isEscalated: dbConversation.isEscalated
+        });
+        
+        if (dbConversation.status !== ConversationStatus.COMPLETED) {
+          // Si NO está completada, cargarla en memoria
+          conversation = {
+            conversationId: dbConversation.conversationId,
+            token: dbConversation.token,
+            phone_number_id: dbConversation.phone_number_id,
+            from: dbConversation.from_number,
+            isEscalated: dbConversation.isEscalated === 1,
+            lastActivity: dbConversation.lastActivity,
+            status: dbConversation.status as ConversationStatus
+          };
+          
+          // Configurar WebSocket para esta conversación restaurada
+          conversation.wsConnection = await this.setupWebSocketConnection(
+            conversation.conversationId,
+            conversation.token,
+            phone_number_id,
+            from
+          );
+          
+          this.conversations.set(from, conversation);
+          logger.info(`Conversación restaurada desde BD: ${conversation.conversationId} para ${from} (estado: ${conversation.status})`);
+        } else {
+          // Si está completada, loguear y continuar para crear una nueva
+          logger.info(`Conversación en BD ${dbConversation.conversationId} para ${from} está COMPLETADA, creando una nueva`);
+          // Conversation sigue siendo undefined para forzar creación de nueva
         }
       }
     } catch (error) {
-      logger.error(`Error al verificar conversación en BD para ${from}`, { error });
+      logger.error(`Error al verificar conversación en BD para ${from}:`, { error });
     }
   }
   
-  // MANTENER verificación existente para conversaciones COMPLETED en memoria
+  // VERIFICACIÓN EN MEMORIA: Si encuentra una completada, eliminarla
   if (conversation && conversation.status === ConversationStatus.COMPLETED) {
-    logger.info(`Conversación ${conversation.conversationId} para ${from} está completada, creando una nueva`);
+    logger.info(`Conversación en memoria ${conversation.conversationId} para ${from} está completada, creando una nueva`);
+    // Eliminar la conversación completada de la memoria para crear una nueva
     this.conversations.delete(from);
     conversation = undefined;
   }
   
-  // MANTENER verificación existente para inactividad de 24 horas
+  // VERIFICACIÓN DE INACTIVIDAD: Si está inactiva por más de 24 horas
   if (conversation && Date.now() - conversation.lastActivity > 24 * 60 * 60 * 1000) {
-    logger.info(`Conversación inactiva para ${from}, creando una nueva`);
+    logger.info(`Conversación ${conversation.conversationId} inactiva para ${from}, creando una nueva`);
     
     // Marcar la conversación antigua como completada en la base de datos
     try {
       const db = await initDatabaseConnection();
       db.prepare(
-        `UPDATE conversations SET status = ? WHERE from_number = ? AND status != ?`
-      ).run(ConversationStatus.COMPLETED, from, ConversationStatus.COMPLETED);
+        `UPDATE conversations SET status = ? WHERE conversationId = ?`
+      ).run(ConversationStatus.COMPLETED, conversation.conversationId);
     } catch (error) {
       logger.error(`Error al marcar conversación antigua como completada: ${from}`, { error });
     }
@@ -168,8 +179,10 @@ public async getOrCreateConversation(from: string, phone_number_id: string): Pro
     conversation = undefined;
   }
   
-  // Resto del código sigue igual
+  // CREAR NUEVA: Si llegamos aquí sin una conversación válida, crear una nueva
   if (!conversation) {
+    logger.info(`Creando nueva conversación para ${from}`);
+    
     // Crear una nueva conversación con DirectLine
     const directLineConversation = await this.createDirectLineConversation();
     
@@ -212,7 +225,7 @@ public async getOrCreateConversation(from: string, phone_number_id: string): Pro
         conversation.status
       );
       
-      logger.info(`Nueva conversación creada y persistida para ${from}`);
+      logger.info(`Nueva conversación creada y persistida: ${conversation.conversationId} para ${from}`);
     } catch (error) {
       logger.error(`Error al persistir nueva conversación: ${from}`, { error });
     }
@@ -220,7 +233,6 @@ public async getOrCreateConversation(from: string, phone_number_id: string): Pro
   
   return conversation;
 }
-
   /**
    * Crear una nueva conversación DirectLine
    */
@@ -515,21 +527,48 @@ private async saveMessage(conversationId: string, from: string, text: string, ag
     }
   }
 
-  /**
-   * Enviar mensaje a la conversación
-   */
-  public async sendMessage(from: string, phone_number_id: string, message: string): Promise<void> {
+/**
+ * Enviar mensaje a la conversación
+ */
+public async sendMessage(from: string, phone_number_id: string, message: string): Promise<void> {
+  try {
     // Verificar si la conversación está escalada
-    if (this.isEscalated(from)) {
-      // Obtener conversación para su ID del sistema
-      const conversation = this.conversations.get(from);
-      if (!conversation) {
-        logger.error(`No se encontró conversación para ${from} al enviar mensaje`);
-        return;
+    // Primero obtener conversación para saber si está escalada
+    let conversation = this.conversations.get(from);
+    
+    // Si no hay conversación en memoria o está completada, verificar en BD
+    if (!conversation || conversation.status === ConversationStatus.COMPLETED) {
+      try {
+        const db = await initDatabaseConnection();
+        const dbConversation = db.prepare(
+          `SELECT * FROM conversations WHERE from_number = ? AND status != ? ORDER BY lastActivity DESC LIMIT 1`
+        ).get(from, ConversationStatus.COMPLETED);
+        
+        if (dbConversation && dbConversation.status !== ConversationStatus.COMPLETED) {
+          // Restaurar conversación activa si existe en BD pero no en memoria
+          conversation = {
+            conversationId: dbConversation.conversationId,
+            token: dbConversation.token,
+            phone_number_id: dbConversation.phone_number_id,
+            from: dbConversation.from_number,
+            isEscalated: dbConversation.isEscalated === 1,
+            lastActivity: dbConversation.lastActivity,
+            status: dbConversation.status as ConversationStatus
+          };
+          
+          this.conversations.set(from, conversation);
+          logger.info(`Restaurada conversación desde BD para mensaje entrante: ${from}`);
+        }
+      } catch (error) {
+        logger.error(`Error al verificar conversación en BD: ${from}`, { error });
+        // Continuar el flujo para crear una nueva si es necesario
       }
-      
-      // Si está escalada, guardar el mensaje en la cola para el agente usando ID del sistema
-      this.queueService.addMessage(conversation.conversationId, {
+    }
+    
+    // Ahora que potencialmente tenemos una conversación, verificar si está escalada
+    if (conversation && conversation.isEscalated) {
+      // Si está escalada, guardar el mensaje en la cola para el agente
+      await this.queueService.addMessage(conversation.conversationId, {
         from: MessageSender.USER,
         text: message
       });
@@ -537,11 +576,15 @@ private async saveMessage(conversationId: string, from: string, text: string, ag
       // Guardar mensaje en la base de datos usando ID del sistema
       await this.saveMessage(conversation.conversationId, 'user', message);
       
+      // Actualizar timestamp de actividad
+      conversation.lastActivity = Date.now();
+      this.updateConversationActivity(from);
+      
       return;
     }
     
-    // Obtener o crear conversación
-    const conversation = await this.getOrCreateConversation(from, phone_number_id);
+    // Si no está escalada o no existe conversación, obtener o crear conversación
+    conversation = await this.getOrCreateConversation(from, phone_number_id);
     
     // Actualizar tiempo de actividad
     conversation.lastActivity = Date.now();
@@ -550,18 +593,15 @@ private async saveMessage(conversationId: string, from: string, text: string, ag
     // Guardar mensaje en la base de datos usando ID del sistema
     await this.saveMessage(conversation.conversationId, 'user', message);
     
-      // AÑADIR EL LOG JUSTO AQUÍ 👇
-    logger.info('DEBUG - Variables para DirectLine:', {
+    // Añadir logging para depuración
+    logger.info('Enviando mensaje al bot:', {
       directlineUrl: `${config.directline.url}/conversations/${conversation.conversationId}/activities`,
-      powerPlatformBaseUrl: config.powerPlatform.baseUrl,
-      botEndpoint: config.powerPlatform.botEndpoint,
       conversationId: conversation.conversationId,
       tokenLength: conversation.token.length,
       fromPrefix: from.substring(0, 5),
       environment: process.env.NODE_ENV
     });
-  
-
+    
     // Enviar mensaje al bot
     const response = await fetch(`${config.directline.url}/conversations/${conversation.conversationId}/activities`, {
       method: 'POST',
@@ -577,9 +617,26 @@ private async saveMessage(conversationId: string, from: string, text: string, ag
     });
     
     if (!response.ok) {
+      const errorText = await response.text();
+      logger.error(`Error al enviar mensaje a DirectLine: ${response.status} ${response.statusText}`, {
+        errorText,
+        conversationId: conversation.conversationId
+      });
       throw new Error(`Error al enviar mensaje a DirectLine: ${response.statusText}`);
     }
+    
+    // Logging exitoso
+    logger.info(`Mensaje enviado exitosamente al bot para ${from}`, {
+      conversationId: conversation.conversationId
+    });
+  } catch (error) {
+    logger.error(`Error en sendMessage: ${from}`, { 
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined 
+    });
+    throw error; // Re-lanzar para manejo superior
   }
+}
 
   /**
    * Verificar si un mensaje indica que se debe escalar la conversación
@@ -748,7 +805,7 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
     const completed = await queueService.completeConversation(conversation.conversationId);
     if (!completed) {
       logger.error(`Error al eliminar conversación ${conversationId} de la cola`);
-      return false;
+      // No retornar false inmediatamente, intentar marcar como completada en BD
     }
     
     // Actualizar estado en la base de datos
@@ -793,7 +850,10 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
     
     logger.info(`Conversación con agente finalizada: ${fromNumber}`);
     
-    // IMPORTANTE: Eliminar conversación de la memoria para que futuros mensajes creen una nueva
+    // IMPORTANTE: Actualizar estado en memoria antes de eliminar
+    conversation.status = ConversationStatus.COMPLETED;
+    
+    // IMPORTANTE: Ahora sí, eliminar conversación de la memoria para que futuros mensajes creen una nueva
     this.conversations.delete(fromNumber);
     logger.info(`Conversación eliminada de la memoria: ${fromNumber}`);
     
