@@ -14,7 +14,7 @@ class ConversationService {
   private conversations: Map<string, ConversationData>;
   private whatsappService: WhatsAppService;
   private queueService = initQueueService();
-  
+
   // Patrones para detectar escalamiento en mensajes del bot
   private escalationPatterns: string[] = [
     "la remisión a un agente por chat",
@@ -295,6 +295,9 @@ private async setupWebSocketConnection(
     }
   );
 
+  // Set para rastrear IDs de mensajes ya procesados para esta conversación específica
+  const processedMessageIds = new Set<string>();
+
   wsConnection.on('message', async (data: WebSocket.Data) => {
     try {
       const dataStr = data.toString();
@@ -302,13 +305,6 @@ private async setupWebSocketConnection(
         console.log('Mensaje WebSocket vacío recibido, ignorando');
         return;
       }
-      
-      // Log del mensaje WebSocket raw
-      logger.debug(`[WS-RAW] Mensaje WebSocket raw para ${conversationId} (${from}):`, {
-        raw: dataStr.substring(0, 1000) + (dataStr.length > 1000 ? '... [truncado]' : ''),
-        dataLength: dataStr.length,
-        receivedAt: new Date().toISOString()
-      });
       
       // Intentar parsear el JSON con manejo de errores
       let message;
@@ -320,150 +316,92 @@ private async setupWebSocketConnection(
       }
         
       if (message.activities && message.activities.length > 0) {
-        // Log de información sobre las actividades recibidas
-        logger.debug(`[WS-INFO] ${message.activities.length} actividades recibidas para ${from}:`, {
-          watermark: message.watermark,
-          timestamp: new Date().toISOString()
-        });
-
-        // Mostrar detalles de cada actividad para debug
-        message.activities.forEach((act: DirectLineActivity, idx: number) => {
-          if (act.from?.role === 'bot' && act.type === 'message') {
-            logger.debug(`[WS-ACTIVIDAD] Bot #${idx+1}:`, {
-              id: act.id,
-              tipo: act.type,
-              timestamp: act.timestamp,
-              fechaISO: act.timestamp ? new Date(act.timestamp).toISOString() : 'sin timestamp',
-              timestampMs: act.timestamp ? new Date(act.timestamp).getTime() : 0,
-              contenido: act.text ? (act.text.substring(0, 50) + (act.text.length > 50 ? '...' : '')) : 'sin texto'
-            });
-          }
+        logger.debug(`Recibidas ${message.activities.length} actividades para ${from}`);
+        
+        // Filtrar solo los mensajes válidos del bot que no han sido procesados
+        const botResponses = message.activities.filter((a: DirectLineActivity) => {
+          return a.from?.role === 'bot' && 
+                 a.type === 'message' &&
+                 a.text &&
+                 a.id &&
+                 !processedMessageIds.has(a.id);
         });
         
-        // Filtrar solo los mensajes de texto del bot
-        const botResponses = message.activities.filter((a: DirectLineActivity) => 
-          a.from?.role === 'bot' && 
-          a.type === 'message' &&
-          a.text
-        );
+        // Si no hay mensajes nuevos, salir
+        if (botResponses.length === 0) {
+          logger.debug(`No hay mensajes nuevos para procesar en este paquete`);
+          return;
+        }
         
-        // Log de mensajes sin ordenar
-        logger.debug(`[WS-SIN-ORDENAR] ${botResponses.length} mensajes del bot para ${from}:`, 
-          botResponses.map((m: DirectLineActivity, i: number) => ({
-            posicionOriginal: i+1,
-            id: m.id,
-            timestamp: m.timestamp,
-            timestampMs: m.timestamp ? new Date(m.timestamp).getTime() : 0,
-            contenido: m.text ? (m.text.substring(0, 30) + (m.text.length > 30 ? '...' : '')) : 'sin texto'
-          }))
-        );
-        
-        // IMPORTANTE: Crear una copia explícita del array antes de ordenar
-        // Ordenar explícitamente por timestamp (de más antiguo a más reciente)
-        const sortedResponses = [...botResponses].sort((a: DirectLineActivity, b: DirectLineActivity) => {
+        // Ordenar mensajes por timestamp
+        const sortedMessages = [...botResponses].sort((a: DirectLineActivity, b: DirectLineActivity) => {
           const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
           const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
-          
-          // Log detallado de la comparación para debug
-          logger.debug(`[WS-COMPARACION] Comparando:`, {
-            msgA: a.id,
-            msgB: b.id,
-            timeA,
-            timeB,
-            diferencia: timeA - timeB,
-            resultado: timeA < timeB ? "A antes que B" : (timeA === timeB ? "Igual" : "B antes que A")
-          });
-          
-          return timeA - timeB; // Orden ascendente (más antiguo primero)
+          return timeA - timeB; // Ordenar de más antiguo a más reciente
         });
         
-        // Log de mensajes después de ordenar
-        logger.debug(`[WS-ORDENADOS] ${sortedResponses.length} mensajes ordenados para ${from}:`, 
-          sortedResponses.map((m: DirectLineActivity, i: number) => ({
-            posicionFinal: i+1,
-            id: m.id,
-            timestamp: m.timestamp,
-            fechaISO: m.timestamp ? new Date(m.timestamp).toISOString() : 'sin timestamp',
-            contenido: m.text ? (m.text.substring(0, 30) + (m.text.length > 30 ? '...' : '')) : 'sin texto'
-          }))
-        );
+        logger.debug(`Procesando ${sortedMessages.length} mensajes ordenados por timestamp`);
         
-        // Procesar mensajes de forma estrictamente secuencial
-        for (let i = 0; i < sortedResponses.length; i++) {
-          const botResponse = sortedResponses[i];
+        // Registrar los IDs para evitar procesamiento duplicado
+        for (const message of sortedMessages) {
+          if (message.id) {
+            processedMessageIds.add(message.id);
+          }
+        }
+        
+        // Procesar mensajes ordenados
+        for (let i = 0; i < sortedMessages.length; i++) {
+          const botResponse = sortedMessages[i];
           
-          // Log de inicio de procesamiento de cada mensaje
-          logger.debug(`[WS-PROCESANDO] Mensaje ${i+1}/${sortedResponses.length} para ${from}:`, {
-            id: botResponse.id,
-            timestamp: botResponse.timestamp,
-            horaProcesoLocal: new Date().toISOString(),
-            contenido: botResponse.text ? (botResponse.text.substring(0, 40) + (botResponse.text.length > 40 ? '...' : '')) : 'sin texto'
-          });
+          logger.debug(`Procesando mensaje ${i+1}/${sortedMessages.length}: ${botResponse.id}`);
           
           if (botResponse.text) {
             // Verificar si es un mensaje de escalamiento
             if (this.isEscalationMessage(botResponse.text)) {
               await this.handleEscalation(from, phone_number_id, botResponse.text);
             } else if (!this.isEscalated(from)) {
-              // Enviar respuesta normal si no está escalado
               try {
-                // Log justo antes de enviar a WhatsApp
-                logger.debug(`[WS-ENVIANDO] Enviando mensaje ${i+1} a WhatsApp para ${from}:`, {
-                  id: botResponse.id,
-                  horaEnvioLocal: new Date().toISOString()
-                });
+                // Esperar un tiempo fijo antes de enviar cada mensaje (excepto el primero)
+                if (i > 0) {
+                  logger.debug(`Esperando 2 segundos antes de enviar mensaje ${i+1}`);
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                }
                 
-                // Enviar el mensaje a WhatsApp y esperar a que termine
+                // Enviar mensaje a WhatsApp
                 await this.whatsappService.sendMessage(
-                  phone_number_id,  // ID del número de WhatsApp Business
-                  from,  // Número del usuario destinatario
+                  phone_number_id,
+                  from,
                   botResponse.text
                 );
                 
-                // Log después de enviar exitosamente
-                logger.debug(`[WS-ENVIADO] Mensaje ${i+1} enviado exitosamente a WhatsApp para ${from}:`, {
-                  id: botResponse.id,
-                  horaFinalizacionLocal: new Date().toISOString()
-                });
+                logger.debug(`Mensaje ${i+1} enviado exitosamente a WhatsApp`);
                 
-                // Guardar el mensaje del bot en la base de datos
+                // Guardar mensaje en base de datos
                 const conversation = this.conversations.get(from);
                 if (conversation) {
                   await this.saveMessage(conversation.conversationId, 'bot', botResponse.text);
-                } else {
-                  logger.error(`No se encontró conversación para ${from} al guardar mensaje del bot`);
                 }
                 
-                // IMPORTANTE: Esperar más tiempo entre mensajes (1 segundo)
-                logger.debug(`[WS-PAUSA] Iniciando pausa de 1 segundo después del mensaje ${i+1} para ${from}`);
+                // Pausa consistente después de cada mensaje
+                logger.debug(`Pausa de 1 segundo después del mensaje ${i+1}`);
                 await new Promise(resolve => setTimeout(resolve, 1000));
-                logger.debug(`[WS-PAUSA-FIN] Pausa finalizada para el mensaje ${i+1}`);
-              } catch (sendError) {
-                logger.error(`[WS-ERROR] Error al enviar mensaje de bot a WhatsApp: ${from}`, { 
-                  error: sendError, 
-                  message: botResponse.text.substring(0, 100) 
-                });
+              } catch (error) {
+                logger.error(`Error al enviar mensaje a WhatsApp: ${error}`);
               }
             }
           }
-          
-          // Log de finalización del procesamiento de este mensaje
-          logger.debug(`[WS-COMPLETADO] Mensaje ${i+1}/${sortedResponses.length} procesado completamente para ${from}`);
         }
         
-        // Log de finalización de todos los mensajes
-        logger.debug(`[WS-TODOS-COMPLETADOS] Todos los mensajes (${sortedResponses.length}) procesados para ${from}`);
-        
-        // Actualizar timestamp de actividad una vez al final del procesamiento
+        // Actualizar timestamp de la conversación
         this.updateConversationActivity(from);
       }
     } catch (error) {
-      console.error('Error al procesar mensaje WebSocket:', error);
+      logger.error(`Error al procesar mensaje WebSocket: ${error}`);
     }
   });
 
   wsConnection.on('error', (error) => {
-    console.error(`Error en WebSocket para conversación ${conversationId}:`, error);
+    logger.error(`Error en WebSocket para conversación ${conversationId}: ${error}`);
   });
 
   return wsConnection;
