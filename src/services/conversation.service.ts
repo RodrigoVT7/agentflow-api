@@ -765,26 +765,27 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
   let conversation: ConversationData | undefined;
   let fromNumber: string | undefined;
   
-  // Primero intentar buscar por conversationId directamente
-  for (const [from, conv] of this.conversations.entries()) {
-    if (conv.conversationId === conversationId) {
-      conversation = conv;
-      fromNumber = from;
-      break;
+  // 1. PRIMER PASO: OBTENER LA CONVERSACIÓN
+  try {
+    // Primero intentar buscar por conversationId directamente en memoria
+    for (const [from, conv] of this.conversations.entries()) {
+      if (conv.conversationId === conversationId) {
+        conversation = conv;
+        fromNumber = from;
+        break;
+      }
     }
-  }
-  
-  // Si no encontramos por conversationId, intentar buscar como si el conversationId fuera un número de teléfono
-  if (!conversation && !fromNumber) {
-    conversation = this.conversations.get(conversationId);
-    if (conversation) {
-      fromNumber = conversationId;
+    
+    // Si no encontramos por conversationId, intentar buscar como si el conversationId fuera un número de teléfono
+    if (!conversation && !fromNumber) {
+      conversation = this.conversations.get(conversationId);
+      if (conversation) {
+        fromNumber = conversationId;
+      }
     }
-  }
-  
-  // Si no encontramos por ninguno de los métodos anteriores, buscar directamente en la BD
-  if (!conversation || !fromNumber) {
-    try {
+    
+    // Si no encontramos por ninguno de los métodos anteriores, buscar directamente en la BD
+    if (!conversation || !fromNumber) {
       const db = await initDatabaseConnection();
       const dbConversation = db.prepare(
         'SELECT * FROM conversations WHERE conversationId = ?'
@@ -806,38 +807,69 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
         logger.info(`Conversación ${conversationId} recuperada de BD para completar: fromNumber=${fromNumber}`);
       } else {
         logger.warn(`No se pudo encontrar la conversación ${conversationId} en BD`);
+        return false;
       }
-    } catch (error) {
-      logger.error(`Error al buscar conversación ${conversationId} en BD`, { error });
     }
-  }
-  
-  // Si todavía no tenemos los datos necesarios, no podemos continuar
-  if (!conversation || !fromNumber) {
-    logger.warn(`No se puede completar la conversación ${conversationId}: datos insuficientes`);
-    return false;
-  }
-  
-  // Guardar info importante para envío de mensaje aunque se limpie de memoria
-  const phoneNumberId = conversation.phone_number_id;
-  const userPhoneNumber = conversation.from;
-  const convId = conversation.conversationId;
-  
-  // Verificar que tenemos los datos mínimos para mensaje
-  if (!phoneNumberId || !userPhoneNumber) {
-    logger.error(`Datos incompletos para enviar mensaje de finalización: phoneNumberId=${phoneNumberId}, userNumber=${userPhoneNumber}`);
-    return false;
-  }
-  
-  try {
-    // 1. PRIMER PASO: ENVIAR MENSAJE DE FINALIZACIÓN
-    // Hacemos esto primero para asegurar que se envíe antes de cualquier cambio en BD
+    
+    // Si todavía no tenemos los datos necesarios, no podemos continuar
+    if (!conversation || !fromNumber) {
+      logger.warn(`No se puede completar la conversación ${conversationId}: datos insuficientes`);
+      return false;
+    }
+    
+    // Guardar info importante para envío de mensaje aunque se limpie de memoria
+    const phoneNumberId = conversation.phone_number_id;
+    const userPhoneNumber = conversation.from;
+    const convId = conversation.conversationId;
+    
+    // Verificar que tenemos los datos mínimos para mensaje
+    if (!phoneNumberId || !userPhoneNumber) {
+      logger.error(`Datos incompletos para enviar mensaje de finalización: phoneNumberId=${phoneNumberId}, userNumber=${userPhoneNumber}`);
+      return false;
+    }
+    
+    // 2. SEGUNDO PASO: ACTUALIZAR LA BASE DE DATOS PRIMERO 
+    // Esto es crítico: marcar la conversación como completada y establecer isEscalated = false
+    const db = await initDatabaseConnection();
+    
+    // Iniciar una transacción para garantizar atomicidad
+    const transaction = db.transaction(() => {
+      // 1. Actualizar la conversación: status=COMPLETED y isEscalated=0
+      db.prepare(
+        'UPDATE conversations SET status = ?, isEscalated = 0, lastActivity = ? WHERE conversationId = ?'
+      ).run(ConversationStatus.COMPLETED, Date.now(), convId);
+      
+      // 2. Eliminar de la cola
+      db.prepare('DELETE FROM queue WHERE conversationId = ?').run(convId);
+      
+      logger.info(`Transacción completada: Conversación ${convId} marcada como completada y no escalada en BD`);
+    });
+    
+    // Ejecutar la transacción
+    transaction();
+    
+    // 3. TERCER PASO: ELIMINAR DE MEMORIA
+    // Actualizar estado en memoria antes de eliminar
+    if (conversation) {
+      conversation.isEscalated = false; // Asegurarse de que isEscalated sea false
+      conversation.status = ConversationStatus.COMPLETED;
+    }
+    
+    // Eliminar de la cola si estaba ahí
+    const queueService = initQueueService();
+    await queueService.completeConversation(convId);
+    
+    // Eliminar de la memoria
+    if (this.conversations.has(fromNumber)) {
+      this.conversations.delete(fromNumber);
+      logger.info(`Conversación eliminada de la memoria: ${fromNumber}`);
+    }
+    
+    // 4. CUARTO PASO: ENVIAR MENSAJE DE FINALIZACIÓN
     const completionMessage = "La conversación con el agente ha finalizado. ¿En qué más puedo ayudarte?";
     
-    logger.info(`Intentando enviar mensaje de finalización a ${userPhoneNumber} vía ${phoneNumberId}`);
-    
     try {
-      // Usar nuestro servicio de WhatsApp directamente (no this.whatsappService)
+      // Usar nuestro servicio de WhatsApp directamente
       const whatsappService = new WhatsAppService();
       
       const messageSent = await whatsappService.sendMessage(
@@ -849,13 +881,11 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
       if (messageSent) {
         logger.info(`Mensaje de finalización enviado exitosamente a ${userPhoneNumber}`);
         
-        // Intentar guardar mensaje en la base de datos
+        // Guardar mensaje en la base de datos
         try {
           await this.saveMessage(convId, 'system', completionMessage);
-          logger.debug(`Mensaje de finalización guardado en BD para ${convId}`);
         } catch (saveError) {
           logger.warn(`No se pudo guardar mensaje de finalización en BD: ${convId}`, { error: saveError });
-          // Continuar aunque falle el guardado
         }
       } else {
         logger.error(`Error al enviar mensaje de finalización a ${userPhoneNumber}`);
@@ -864,53 +894,6 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
       logger.error(`Excepción al enviar mensaje de finalización a ${userPhoneNumber}`, { 
         error: msgError instanceof Error ? msgError.message : String(msgError)
       });
-      // Continuar con el proceso a pesar del error
-    }
-    
-    // 2. SEGUNDO PASO: ELIMINAR DE MEMORIA Y ACTUALIZAR BD
-    // Inicializar queueService para acceder a los métodos
-    const queueService = initQueueService();
-    
-    // Eliminar de la cola si estaba ahí
-    await queueService.completeConversation(convId);
-    
-    // Marcar como completada en la base de datos
-    try {
-      const db = await initDatabaseConnection();
-      
-      // Verificar si ya está completada
-      const currentStatus = db.prepare(
-        'SELECT status FROM conversations WHERE conversationId = ?'
-      ).get(convId);
-      
-      if (currentStatus && currentStatus.status === ConversationStatus.COMPLETED) {
-        logger.info(`Conversación ${convId} ya estaba marcada como completada en BD`);
-      } else {
-        // Actualizar estado a completada
-        db.prepare(
-          'UPDATE conversations SET status = ?, isEscalated = 0, lastActivity = ? WHERE conversationId = ?'
-        ).run(ConversationStatus.COMPLETED, Date.now(), convId);
-        
-        // Eliminar de la cola en BD por si acaso
-        db.prepare('DELETE FROM queue WHERE conversationId = ?').run(convId);
-        
-        logger.info(`Conversación ${convId} marcada como completada en BD`);
-      }
-    } catch (dbError) {
-      logger.error(`Error al actualizar estado en BD para ${convId}`, { error: dbError });
-      // Continuar a pesar del error para limpiar memoria
-    }
-    
-    // 3. TERCER PASO: LIMPIAR MEMORIA
-    // Actualizar estado en memoria antes de eliminar
-    if (conversation) {
-      conversation.status = ConversationStatus.COMPLETED;
-    }
-    
-    // Eliminar de memoria
-    if (this.conversations.has(fromNumber)) {
-      this.conversations.delete(fromNumber);
-      logger.info(`Conversación eliminada de la memoria: ${fromNumber}`);
     }
     
     return true;
@@ -919,6 +902,18 @@ public async completeAgentConversation(conversationId: string): Promise<boolean>
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined 
     });
+    
+    // Intentar actualizar la BD directamente como último recurso
+    try {
+      const db = await initDatabaseConnection();
+      db.prepare(
+        'UPDATE conversations SET status = ?, isEscalated = 0 WHERE conversationId = ?'
+      ).run(ConversationStatus.COMPLETED, conversationId);
+      
+      logger.info(`Conversación ${conversationId} marcada como completada en BD (mecanismo de recuperación)`);
+    } catch (finalError) {
+      logger.error(`Error crítico: No se pudo actualizar la BD durante la recuperación`, { error: finalError });
+    }
     
     // Intentar limpiar memoria aunque haya error
     if (fromNumber && this.conversations.has(fromNumber)) {
