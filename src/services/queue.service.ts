@@ -230,10 +230,11 @@ private async loadMessagesForQueueItem(queueItem: QueueItem): Promise<void> {
       ).run(agentId, conversationId);
       
       // Actualizar estado de la conversación
-      db.prepare(
-        'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?'
-      ).run(ConversationStatus.ASSIGNED, Date.now(), conversationId);
-      
+      // Actualizar estado de la conversación
+db.prepare(
+  'UPDATE conversations SET status = ?, lastActivity = ? WHERE conversationId = ?'
+).run(ConversationStatus.AGENT, Date.now(), conversationId);
+
       // Añadir mensaje de sistema
       await this.addSystemMessage(conversationId, `Agente ${agentId} se ha unido a la conversación`);
       
