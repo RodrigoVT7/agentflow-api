@@ -33,6 +33,13 @@ interface AppConfig {
     // Intervalo para revisar conversaciones inactivas (1 hora en milisegundos)
     cleanupInterval: number;
   };
+  agentSupport: {
+    responseTimeoutSeconds: number; // Tiempo en segundos antes del primer aviso
+    waitingMessage: string;         // Mensaje a enviar después del primer timeout
+    redirectTimeoutMultiplier: number; // Multiplicador para el segundo timeout
+    redirectMessage: string;        // Mensaje enviado al usuario al redireccionar
+    botMenuTrigger: string;         // Texto a enviar al bot para activar el menú
+  };
 }
 
 // Valores por defecto y validaciones
@@ -61,6 +68,15 @@ const config: AppConfig = {
   conversation: {
     inactivityTimeout: 24 * 60 * 60 * 1000, // 24 horas en milisegundos
     cleanupInterval: 60 * 60 * 1000, // 1 hora en milisegundos
+  },
+  agentSupport: {
+    responseTimeoutSeconds: parseInt(process.env.AGENT_RESPONSE_TIMEOUT_SECONDS || '30', 10),
+    waitingMessage: process.env.AGENT_WAITING_MESSAGE || 
+      "Todos nuestros agentes están ocupados actualmente. Por favor, espere y atenderemos su interacción lo antes posible.",
+    redirectTimeoutMultiplier: parseInt(process.env.AGENT_REDIRECT_TIMEOUT_MULTIPLIER || '2', 10),
+    redirectMessage: process.env.AGENT_REDIRECT_MESSAGE || 
+      "Debido a la inactividad, te regreso al menú principal.",
+    botMenuTrigger: process.env.BOT_MENU_TRIGGER || "Menu"
   }
 };
 

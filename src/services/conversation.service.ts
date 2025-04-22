@@ -133,27 +133,46 @@ class ConversationService {
       // 1. Obtener nuevo token
       const tokenData = await this.getDirectLineToken();
       
+      // Verificar que el token obtenido sea válido
+    if (!tokenData || !tokenData.token) {
+      logger.error(`Token recibido inválido o vacío al refrescar para conversación ${conversation.conversationId}`);
+      return false;
+    }
+
       // 2. Actualizar en memoria
       conversation.token = tokenData.token;
       conversation.tokenTimestamp = tokenData.timestamp;
       
-      // 3. Actualizar en base de datos
+      // 3. Actualizar en base de datos - manejo explícito de errores
+    try {
       const db = await initDatabaseConnection();
       db.prepare(
-        `UPDATE conversations SET token = ?, tokenTimestamp = ? WHERE conversationId = ?`
-      ).run(tokenData.token, tokenData.timestamp, conversation.conversationId);
+        `UPDATE conversations SET token = ?, tokenTimestamp = ?, lastActivity = ? WHERE conversationId = ?`
+      ).run(tokenData.token, tokenData.timestamp, Date.now(), conversation.conversationId);
       
+      logger.debug(`Token actualizado en base de datos para conversación ${conversation.conversationId}`);
+    } catch (dbError) {
+      logger.error(`Error al actualizar token en BD para conversación ${conversation.conversationId}`, { 
+        error: dbError instanceof Error ? dbError.message : String(dbError)
+      });
+      // Continuamos a pesar del error de BD porque el token ya se actualizó en memoria
+    }
+
       // 4. Reconectar WebSocket con nuevo token
       if (conversation.wsConnection) {
         try {
           // Cerrar el antiguo
           conversation.wsConnection.close();
-        } catch (wsError) {
-          logger.warn(`Error al cerrar WebSocket antigua para ${conversation.from}:`, { error: wsError });
-        }
+        }catch (wsCloseError) {
+        logger.warn(`Error al cerrar WebSocket anterior: ${conversation.conversationId}`, { 
+          error: wsCloseError instanceof Error ? wsCloseError.message : String(wsCloseError)
+        });
+      }
       }
       
-      // 5. Crear nueva conexión WebSocket con el nuevo token
+       
+    // 5. Crear nueva conexión WebSocket con el nuevo token
+    try {
       conversation.wsConnection = await this.setupWebSocketConnection(
         conversation.conversationId,
         tokenData.token, 
@@ -161,8 +180,19 @@ class ConversationService {
         conversation.from
       );
       
-      logger.info(`Token refrescado exitosamente para conversación ${conversation.conversationId}`);
-      return true;
+      logger.debug(`Nueva conexión WebSocket establecida para conversación ${conversation.conversationId}`);
+    } catch (wsError) {
+      logger.warn(`Error al crear nueva conexión WebSocket para ${conversation.conversationId}, continuando sin WebSocket`, {
+        error: wsError instanceof Error ? wsError.message : String(wsError)
+      });
+      // Continuamos sin WebSocket
+      conversation.wsConnection = undefined;
+    }
+    
+    logger.info(`Token refrescado exitosamente para conversación ${conversation.conversationId}`);
+    return true;
+
+
     } catch (error) {
       logger.error(`Error al refrescar token para conversación ${conversation.conversationId}:`, { 
         error: error instanceof Error ? error.message : String(error),
@@ -264,31 +294,49 @@ class ConversationService {
     }
   }
 
-  /**
-   * Obtener o crear una conversación para un usuario
-   */
-  public async getOrCreateConversation(from: string, phone_number_id: string): Promise<ConversationData> {
-    // Verificar si ya existe la conversación activa en memoria
+/**
+ * Obtener o crear una conversación para un usuario con manejo mejorado de errores
+ * Incluye mejor manejo de tokens inválidos y verificación robusta
+ */
+public async getOrCreateConversation(from: string, phone_number_id: string): Promise<ConversationData> {
+  try {
+    // 1. Verificar si ya existe la conversación activa en memoria
     let conversation = this.conversations.get(from);
     
-    // Si encontramos una conversación completada en memoria, eliminarla
+    // 2. Si encontramos una conversación completada en memoria, eliminarla
     if (conversation && conversation.status === ConversationStatus.COMPLETED) {
       logger.info(`Conversación en memoria ${conversation.conversationId} para ${from} está completada, eliminando para crear una nueva`);
+      // Cerrar WebSocket si existe
+      if (conversation.wsConnection) {
+        try {
+          conversation.wsConnection.close();
+        } catch (wsError) {
+          logger.warn(`Error al cerrar WebSocket de conversación completada: ${from}`, { error: wsError });
+        }
+      }
       this.conversations.delete(from);
       conversation = undefined;
     }
     
-    // Si tenemos conversación en memoria, verificar validez del token
+    // 3. Si tenemos conversación en memoria, verificar validez del token
     if (conversation && conversation.tokenTimestamp) {
       const tokenAge = Date.now() - conversation.tokenTimestamp;
       
-      // Si el token está expirado, refrescarlo
-      if (tokenAge >= TOKEN_EXPIRATION_MS) {
-        logger.info(`Token expirado para conversación ${conversation.conversationId}, refrescando...`);
+      // Si el token está expirado o está a punto de expirar, refrescarlo
+      if (tokenAge >= TOKEN_EXPIRATION_MS - (5 * 60 * 1000)) { // 5 minutos antes de expirar
+        logger.info(`Token expirado o a punto de expirar para conversación ${conversation.conversationId}, refrescando...`);
         
         const tokenRefreshed = await this.refreshConversationToken(conversation);
         if (!tokenRefreshed) {
           logger.warn(`No se pudo refrescar token, se creará nueva conversación para ${from}`);
+          // Eliminar completamente para evitar reutilizar partes problemáticas
+          if (conversation.wsConnection) {
+            try {
+              conversation.wsConnection.close();
+            } catch (wsError) {
+              logger.warn(`Error al cerrar WebSocket al fallar refreshToken: ${from}`, { error: wsError });
+            }
+          }
           this.conversations.delete(from);
           conversation = undefined;
         } else {
@@ -297,7 +345,7 @@ class ConversationService {
       }
     }
     
-    // Si no está en memoria o fue eliminada, verificar en la base de datos
+    // 4. Si no está en memoria o fue eliminada, verificar en la base de datos
     if (!conversation) {
       try {
         const db = await initDatabaseConnection();
@@ -352,8 +400,18 @@ class ConversationService {
               logger.error(`Error al configurar WebSocket para conversación restaurada ${dbConversation.conversationId}:`, { 
                 error: wsError instanceof Error ? wsError.message : String(wsError)
               });
-              // No usar esta conversación, se creará nueva
-              conversation = undefined;
+              
+              // Verificar si podemos seguir sin WebSocket
+              if (dbConversation.status === ConversationStatus.AGENT || dbConversation.isEscalated === 1) {
+                // Si está escalada, podemos continuar sin WebSocket
+                logger.info(`Continuando con conversación escalada ${dbConversation.conversationId} sin WebSocket`);
+                conversation.wsConnection = undefined;
+                this.conversations.set(from, conversation);
+              } else {
+                // Para conversaciones con bot, necesitamos WebSocket, crear nueva
+                logger.warn(`No se pudo configurar WebSocket para conversación de bot, creando nueva para ${from}`);
+                conversation = undefined;
+              }
             }
           }
         } else {
@@ -368,7 +426,7 @@ class ConversationService {
       }
     }
     
-    // VERIFICACIÓN DE INACTIVIDAD: Si está inactiva por más de 24 horas
+    // 5. VERIFICACIÓN DE INACTIVIDAD: Si está inactiva por más de 24 horas
     if (conversation && Date.now() - conversation.lastActivity > INACTIVE_TIMEOUT_MS) {
       logger.info(`Conversación ${conversation.conversationId} inactiva para ${from}, creando una nueva`);
       
@@ -383,23 +441,59 @@ class ConversationService {
         // Continuamos a pesar del error para crear una nueva
       }
       
+      // Cerrar WebSocket si existe
+      if (conversation.wsConnection) {
+        try {
+          conversation.wsConnection.close();
+        } catch (wsError) {
+          logger.warn(`Error al cerrar WebSocket de conversación inactiva: ${from}`, { error: wsError });
+        }
+      }
+      
       // Eliminar de la memoria para que se cree una nueva
       this.conversations.delete(from);
       conversation = undefined;
     }
     
-    // CREAR NUEVA: Si llegamos aquí sin una conversación válida, crear una nueva
+    // 6. CREAR NUEVA: Si llegamos aquí sin una conversación válida, crear una nueva
     if (!conversation) {
       conversation = await this._startNewConversationForUser(from, phone_number_id);
+      logger.info(`Nueva conversación creada para ${from}: ${conversation.conversationId}`);
     }
     
+    // 7. Verificación final
     if (!conversation) {
       throw new Error(`No se pudo obtener ni crear una conversación para ${from}`);
     }
     
+    // 8. Actualizar timestamp de actividad
+    conversation.lastActivity = Date.now();
+    await this.updateConversationActivity(from);
+    
     return conversation;
+  } catch (error) {
+    logger.error(`Error crítico en getOrCreateConversation para ${from}:`, {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
+    
+    // Último recurso: Si todo falló, intentar crear una nueva conversación desde cero
+    try {
+      logger.warn(`Intentando crear nueva conversación como último recurso para ${from}`);
+      // Asegurar que no haya residuos en memoria
+      this.conversations.delete(from);
+      
+      // Crear completamente nueva
+      const newConversation = await this._startNewConversationForUser(from, phone_number_id);
+      return newConversation;
+    } catch (lastError) {
+      logger.error(`Error fatal al crear conversación como último recurso para ${from}:`, {
+        error: lastError instanceof Error ? lastError.message : String(lastError)
+      });
+      throw new Error(`No se pudo obtener ni crear una conversación para ${from} después de múltiples intentos`);
+    }
   }
-
+}
   /**
    * Crear una nueva conversación para un usuario
    * (Método extraído para mejor modularidad)
@@ -1081,26 +1175,76 @@ class ConversationService {
         await this.sendMessageToBot(conversation, message);
         logger.info(`Mensaje enviado exitosamente al bot para ${from} (conversationId=${conversation.conversationId})`);
       } catch (error) {
-        // Si el error es de autenticación (401), intentar refrescar token y reintentar
-        if (error instanceof Error && error.message.includes('401')) {
-          logger.warn(`Error de autenticación (401) al enviar mensaje, refrescando token: ${from}`);
+        // Verificar si es un error de token inválido
+        const isTokenError = error instanceof Error && 
+                           (error.message.includes('TokenInvalid') || 
+                            error.message.includes('401') || 
+                            error.message.includes('403'));
+        
+        if (isTokenError) {
+          logger.warn(`Error de token detectado al enviar mensaje, intentando refrescar: ${from}`);
           
-          const refreshed = await this.refreshConversationToken(conversation);
-          if (refreshed) {
-            // Reintentar con el nuevo token
-            try {
-              await this.sendMessageToBot(conversation, message);
-              logger.info(`Mensaje enviado exitosamente al bot después de refrescar token: ${from}`);
+          try {
+            // Intentar refrescar el token
+            const refreshed = await this.refreshConversationToken(conversation);
+            
+            if (refreshed) {
+              // Reintentar con el nuevo token
+              logger.info(`Token refrescado, reintentando envío para ${from}`);
+              try {
+                await this.sendMessageToBot(conversation, message);
+                logger.info(`Mensaje enviado exitosamente al bot después de refrescar token: ${from}`);
+                return;
+              } catch (retryError) {
+                logger.error(`Error al enviar mensaje después de refrescar token: ${from}`, { 
+                  error: retryError instanceof Error ? retryError.message : String(retryError)
+                });
+                
+                // Si falla el reintento, verificar si es por token inválido nuevamente
+                const isStillTokenError = retryError instanceof Error && 
+                                        (retryError.message.includes('TokenInvalid') || 
+                                         retryError.message.includes('401') || 
+                                         retryError.message.includes('403'));
+                
+                // Si después de refrescar sigue fallando por token, crear una nueva conversación
+                if (isStillTokenError) {
+                  logger.warn(`Token sigue siendo inválido después de refrescar, creando nueva conversación para ${from}`);
+                  
+                  // Asegurar que se elimina la conversación problemática de la memoria
+                  this.conversations.delete(from);
+                  
+                  // Crear una nueva conversación como último recurso
+                  const newConversation = await this._startNewConversationForUser(from, phone_number_id);
+                  
+                  // Intentar enviar con la nueva conversación
+                  await this.sendMessageToBot(newConversation, message);
+                  logger.info(`Mensaje enviado exitosamente con nueva conversación para ${from}`);
+                  return;
+                }
+              }
+            } else {
+              // Si no se pudo refrescar el token, crear nueva conversación
+              logger.warn(`No se pudo refrescar token para ${from}, creando nueva conversación`);
+              
+              // Eliminar la conversación problemática
+              this.conversations.delete(from);
+              
+              // Crear nueva conversación
+              const newConversation = await this._startNewConversationForUser(from, phone_number_id);
+              
+              // Intentar enviar con la nueva conversación
+              await this.sendMessageToBot(newConversation, message);
+              logger.info(`Mensaje enviado exitosamente con nueva conversación para ${from}`);
               return;
-            } catch (retryError) {
-              logger.error(`Error al enviar mensaje después de refrescar token: ${from}`, { 
-                error: retryError instanceof Error ? retryError.message : String(retryError)
-              });
             }
+          } catch (refreshError) {
+            logger.error(`Error al intentar refrescar token o crear nueva conversación: ${from}`, {
+              error: refreshError instanceof Error ? refreshError.message : String(refreshError)
+            });
           }
         }
         
-        // Si llegamos aquí, los reintentos fallaron o no pudimos refrescar el token
+        // Si llegamos aquí, los reintentos fallaron o no era un error de token
         logger.error(`Error definitivo al enviar mensaje a DirectLine: ${from}`, { 
           error: error instanceof Error ? error.message : String(error),
           stack: error instanceof Error ? error.stack : undefined
@@ -1121,6 +1265,12 @@ class ConversationService {
    */
   private async sendMessageToBot(conversation: ConversationData, message: string): Promise<void> {
     try {
+
+      // Verificar token antes de enviar (validación adicional)
+    if (!conversation.token) {
+      throw new Error('Token faltante para la conversación');
+    }
+
       const response = await this.retryApiCall(() => fetch(`${config.directline.url}/conversations/${conversation.conversationId}/activities`, {
         method: 'POST',
         headers: {
@@ -1134,11 +1284,32 @@ class ConversationService {
         })
       }));
       
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Error al enviar mensaje a DirectLine: ${response.status} ${response.statusText} - ${errorText}`);
+      
+    if (!response.ok) {
+      const errorText = await response.text();
+      
+      // Detectar específicamente el error de token no válido
+      if (response.status === 403 && errorText.includes('Token not valid for this conversation')) {
+        logger.warn(`Token no válido detectado para conversación ${conversation.conversationId}, requiere refresco`);
+        throw new Error(`TokenInvalid: ${errorText}`);
       }
+      
+      throw new Error(`Error al enviar mensaje a DirectLine: ${response.status} ${response.statusText} - ${errorText}`);
+    }
+
+     // Si llegamos aquí, el mensaje se envió correctamente
+     logger.debug(`Mensaje enviado correctamente a DirectLine para conversación ${conversation.conversationId}`);
+    
+
     } catch (error) {
+      // Propagar el error específico de token para manejo especial
+      if (error instanceof Error && 
+          (error.message.includes('TokenInvalid') || 
+           error.message.includes('403') || 
+           error.message.includes('401'))) {
+        throw new Error('TokenInvalid: Token no válido para esta conversación');
+      }
+      
       logger.error(`Error al enviar mensaje a DirectLine: ${conversation.conversationId}`, { 
         error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined
@@ -1577,6 +1748,147 @@ class ConversationService {
     
     logger.info('Limpieza de conversaciones inactivas completada');
   }
+
+/**
+ * Redirecciona una conversación desde un agente de vuelta al bot debido a inactividad.
+ * Incluye eliminación completa de la cola para evitar confusión en el panel de agentes.
+ */
+public async redirectConversationToBot(conversationId: string): Promise<void> {
+  logger.info(`Intentando redireccionar conversación ${conversationId} al bot.`);
+
+  // Buscar conversación (primero en memoria, luego potencialmente en BD si es necesario)
+  let conversation: ConversationData | undefined;
+  let fromNumber: string | undefined;
+
+  for (const [from, conv] of this.conversations.entries()) {
+    if (conv.conversationId === conversationId) {
+      conversation = conv;
+      fromNumber = from;
+      break;
+    }
+  }
+
+  // Si no está en memoria, intentar obtenerla de BD para obtener detalles esenciales
+  if (!conversation) {
+    try {
+      const db = await initDatabaseConnection();
+      const dbConv = db.prepare('SELECT * FROM conversations WHERE conversationId = ?').get(conversationId);
+      if (dbConv) {
+        conversation = {
+          conversationId: dbConv.conversationId,
+          token: dbConv.token, // Necesario para enviar "Menu"
+          tokenTimestamp: dbConv.tokenTimestamp || dbConv.lastActivity,
+          phone_number_id: dbConv.phone_number_id,
+          from: dbConv.from_number,
+          isEscalated: true, // Asumir que estaba escalada si estamos redireccionando
+          lastActivity: dbConv.lastActivity,
+          status: dbConv.status as ConversationStatus,
+          // wsConnection podría faltar si se carga desde BD
+        };
+        fromNumber = dbConv.from_number;
+        logger.info(`Conversación ${conversationId} obtenida de BD para redirección.`);
+        // Añadir a memoria temporalmente si es necesario para actualización de estado
+        if (fromNumber && !this.conversations.has(fromNumber)) {
+          this.conversations.set(fromNumber, conversation);
+        }
+      } else {
+        logger.error(`No se puede redireccionar: Conversación ${conversationId} no encontrada en memoria o BD.`);
+        return;
+      }
+    } catch (dbError) {
+      logger.error(`Error de BD al obtener conversación ${conversationId} para redirección.`, { error: dbError });
+      return;
+    }
+  }
+
+  // Asegurar que tenemos el objeto de conversación ahora
+  if (!conversation) {
+    logger.error(`No se puede redireccionar: Error al cargar datos de conversación para ${conversationId}.`);
+    return;
+  }
+  
+  // Asegurar que fromNumber es una cadena válida
+  if (!fromNumber) {
+    // Si llegamos aquí con conversación pero sin fromNumber, usar from de la conversación
+    fromNumber = conversation.from;
+    logger.warn(`fromNumber no disponible, usando conversation.from: ${fromNumber}`);
+  }
+
+  // 1. Eliminar COMPLETAMENTE de la cola (no solo la asignación)
+  const queueService = initQueueService(); // Obtener instancia
+  const removedFromQueue = await queueService.removeFromQueue(conversationId);
+  if (!removedFromQueue) {
+    logger.warn(`La conversación ${conversationId} no pudo ser eliminada de la cola durante la redirección al bot.`);
+    // Continuar con la redirección aunque no se haya podido eliminar de la cola
+  }
+
+  // 2. Actualizar estado de conversación (memoria y BD) de vuelta a BOT
+  conversation.isEscalated = false;
+  conversation.status = ConversationStatus.BOT;
+  conversation.lastActivity = Date.now();
+  
+  // Asegurar que WebSocket se restablezca potencialmente si es necesario (podría haberse cerrado)
+  // Reconfigurar conexión WS si no existe o está cerrada
+  if (!conversation.wsConnection || conversation.wsConnection.readyState !== WebSocket.OPEN) {
+    logger.info(`WebSocket faltante o cerrado para ${conversationId}, intentando restablecer para bot.`);
+    try {
+      conversation.wsConnection = await this.setupWebSocketConnection(
+        conversation.conversationId,
+        conversation.token,
+        conversation.phone_number_id,
+        conversation.from
+      );
+    } catch (wsError) {
+      logger.error(`Error al restablecer WebSocket para ${conversationId} durante redirección. La interacción con el bot podría fallar.`, { error: wsError });
+      conversation.wsConnection = undefined; // Asegurar que se marque como undefined
+    }
+  }
+
+  try {
+    const db = await initDatabaseConnection();
+    db.prepare(
+      `UPDATE conversations SET isEscalated = 0, status = ?, lastActivity = ? WHERE conversationId = ?`
+    ).run(ConversationStatus.BOT, conversation.lastActivity, conversation.conversationId);
+    logger.info(`Estado de conversación ${conversationId} actualizado a BOT en BD.`);
+  } catch (dbError) {
+    logger.error(`Error al actualizar estado de conversación a BOT en BD para ${conversationId}. Posible inconsistencia de estado.`, { error: dbError });
+    // Continuar a pesar del error de BD
+  }
+
+  // 3. Enviar mensaje de notificación al usuario
+  try {
+    await this.whatsappService.sendMessage(
+      conversation.phone_number_id,
+      conversation.from,
+      config.agentSupport.redirectMessage
+    );
+    await this.saveMessage(conversation.conversationId, 'system', config.agentSupport.redirectMessage);
+  } catch (msgError) {
+    logger.error(`Error al enviar notificación de redirección al usuario ${conversation.from}`, { error: msgError });
+  }
+
+  // 4. Enviar mensaje de activación al bot
+  try {
+    logger.info(`Enviando '${config.agentSupport.botMenuTrigger}' al bot para conversación ${conversationId}`);
+    await this.sendMessageToBot(conversation, config.agentSupport.botMenuTrigger);
+    
+    // También agregar este mensaje a la base de datos para mantener coherencia
+    await this.saveMessage(conversation.conversationId, 'user', config.agentSupport.botMenuTrigger);
+  } catch (botError) {
+    logger.error(`Error al enviar activador de menú al bot para ${conversationId}`, { error: botError });
+    // Informar al usuario quizás? O solo registrar.
+    try {
+      await this.whatsappService.sendMessage(
+        conversation.phone_number_id,
+        conversation.from,
+        "Tuvimos un problema al regresar al menú principal. Por favor, intenta escribir 'Menu' nuevamente."
+      );
+    } catch (secondaryError) {
+      logger.error(`Error al enviar mensaje de error de fallback al usuario ${conversation.from}`, { error: secondaryError });
+    }
+  }
+}
+
 }
 
 // Singleton
